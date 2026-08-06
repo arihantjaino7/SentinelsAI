@@ -1,0 +1,182 @@
+@import "tailwindcss";
+
+/* Design tokens — the single source of truth for the look described in
+   docs/DESIGN.md. No component should ever hardcode a hex value; if a colour
+   isn't in this block, it isn't part of the design. */
+@theme {
+  /* Warm near-black, deliberately not #000 — pure black reads as a void,
+     this reads as paper photographed in low light.
+
+     Darkened from #0e0e0d on request (roughly 97% black rather than 95%).
+     The warm bias is kept — red and green still sit a point above blue —
+     because that is what stops it going the cold, dead grey that a neutral
+     near-black turns into on an OLED panel. */
+  --color-ink: #070706;
+
+  /* Warm off-white, deliberately not #fff — white on near-black is the
+     highest-contrast pairing there is, and genuinely tiring to read. */
+  --color-parchment: #d9d7d4;
+
+  /* Secondary text: labels, timestamps, the things you read second. */
+  --color-muted: #8b8884;
+
+  /* Hairlines. Same warm family as the text, so rules never look blue-grey. */
+  --color-rule: rgba(217, 215, 212, 0.14);
+
+  /* Oxidized red. RESERVED FOR CRITICAL FINDINGS ONLY — see docs/DESIGN.md.
+     The restraint is the whole point: one colour, used rarely, means something
+     when it finally appears. */
+  --color-critical: #8b3a2f;
+}
+
+/* `inline` because these point at CSS variables next/font defines at runtime —
+   Tailwind must emit the var() reference rather than try to resolve it now. */
+@theme inline {
+  --font-display: var(--font-instrument-serif);
+  --font-body: var(--font-inter);
+  --font-mono: var(--font-jetbrains-mono);
+  /* Landing page only — see the note in app/layout.tsx. `font-geo` in
+     markup. The rest of the product keeps `font-display` (Instrument
+     Serif), so docs/DESIGN.md's three-role system is unchanged wherever
+     the tool actually does its work. */
+  --font-geo: var(--font-space-grotesk);
+}
+
+/* The frosted panel from docs/DESIGN.md, as one named utility rather than four
+   classes repeated at every call site. CSS backdrop-filter, not WebGL — the
+   design brief costed both and chose this deliberately. */
+@utility glass {
+  background-color: rgb(255 255 255 / 0.04);
+  border: 1px solid rgb(255 255 255 / 0.08);
+  backdrop-filter: blur(20px) saturate(1.2);
+}
+
+/* Screen 2's entrance — "the set piece" (docs/DESIGN.md). A panel condensing
+   into focus, for the moment an agent's real result actually lands. Named
+   keyframes, not an inline animation, so both the `@utility` below and the
+   `@media` override can refer to the same definition by name. */
+@keyframes materialize {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@utility materialize-in {
+  animation: materialize 550ms cubic-bezier(0.16, 1, 0.3, 1) both;
+
+  /* The CSS equivalent of useScrollDrift.ts's `matchMedia` check — same
+     accessibility setting, checked here in plain CSS instead of JS, since
+     this animation is pure CSS to begin with and never touches JS at all. */
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+}
+
+/* ── Landing-page motion ─────────────────────────────────────────────────
+   Everything below animates ONLY `opacity` and `transform`. Both are
+   composited on the GPU, so they never trigger layout or paint — that is
+   what actually buys a steady 60fps, not a library. Deliberately no
+   `filter: blur()` anywhere: it looks expensive because it *is* expensive,
+   and it's the usual reason a "premium" hero drops frames on a laptop. */
+
+/* The masked word reveal. The parent clips, the child starts fully below
+   its own box and rises into view — so the word appears to be uncovered
+   rather than to fly in. Each word gets its own delay for the stagger. */
+@keyframes word-rise {
+  from {
+    opacity: 0;
+    transform: translateY(110%);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* The generic entrance for everything that isn't split text. */
+@keyframes fade-rise {
+  from {
+    opacity: 0;
+    transform: translateY(22px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* The hero image's one-time arrival: settles down out of a slight
+   over-scale, which reads as a camera coming to rest. */
+@keyframes image-settle {
+  from {
+    opacity: 0;
+    transform: scale(1.06) translateY(24px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+/* The perpetual drift underneath it. Long, small, and sinusoidal — a big
+   or fast float is the difference between "alive" and "distracting". */
+@keyframes float-soft {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-12px);
+  }
+}
+
+/* cubic-bezier(0.16, 1, 0.3, 1) is expo-out — the same curve `materialize`
+   above already uses, and the CSS equivalent of the `expo.out` that motion
+   references recommend for reveals. Fast out of the gate, long settle. */
+@utility rise-in {
+  animation: word-rise 900ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: var(--rise-delay, 0ms);
+}
+
+@utility fade-in-up {
+  animation: fade-rise 900ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: var(--rise-delay, 0ms);
+}
+
+/* The hero image's two stacked animations, as named utilities rather than
+   inline styles. That distinction matters: an inline `style` attribute
+   cannot be overridden by a media query, so a reduced-motion user would be
+   stuck with the animation running. As classes, the block below can switch
+   them off properly. */
+@utility hero-settle {
+  animation: image-settle 1400ms cubic-bezier(0.16, 1, 0.3, 1) 900ms both;
+}
+
+@utility hero-float {
+  /* Starts after `hero-settle` has finished (900ms delay + 1400ms run), so
+     the drift picks up exactly where the entrance puts the image down
+     instead of fighting it mid-flight. */
+  animation: float-soft 7s ease-in-out 2300ms infinite;
+}
+
+/* Reduced motion: the content must still END in its final state, so these
+   are switched off rather than left mid-animation. `both` fill mode above
+   would otherwise strand an element at opacity 0 forever. */
+@media (prefers-reduced-motion: reduce) {
+  .rise-in,
+  .fade-in-up,
+  .hero-settle,
+  .hero-float {
+    animation: none;
+  }
+}
+
+body {
+  background-color: var(--color-ink);
+  color: var(--color-parchment);
+}
