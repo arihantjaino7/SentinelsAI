@@ -1,0 +1,31 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets — .env.example is committed, .env is NOT
+.env
+.env.local
+
+# SQLite data — local persistence, not shared via git
+backend/data/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+npm-debug.log*
+
+# Local run logs (e.g. uvicorn.log from `uvicorn ... > uvicorn.log`)
+*.log
+
+# Third-party Claude Code skills (vendor data, reproducible via their installer)
+.claude/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
