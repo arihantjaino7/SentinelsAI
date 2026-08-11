@@ -21,7 +21,7 @@ import type { AgentInfo } from "@/lib/api";
 import { groupByCategory, HEADLINE_SEVERITIES } from "@/lib/findings";
 import { useScrollDrift } from "@/lib/useScrollDrift";
 import { ScoreRing } from "@/components/ScoreRing";
-import { AgentReel } from "@/components/AgentReel";
+import { AgentCarousel } from "@/components/AgentCarousel";
 import { Footer } from "@/components/Footer";
 
 /* The single worst problem in the report, as a plain-English headline.
@@ -280,12 +280,13 @@ export default function ScanPage() {
 
     </article>
 
-    {/* Outside the article, and deliberately so: the reel's panels bleed to
-        the viewport's left edge, which they cannot do from inside a centred
-        max-width column without a negative-margin trick that fights the
-        scrollbar. Clicking a panel opens that agent's own detail page — this
-        page stays a summary, the depth lives one click away. */}
-    <AgentReel agents={report.agents} info={agentInfo} scanId={scanId} />
+    {/* Outside the article: AgentReel's panels used to bleed to the
+        viewport's left edge, which needed to sit outside a centred max-width
+        column. AgentCarousel centres itself instead, but staying outside the
+        article keeps this a two-line swap rather than a layout change.
+        Clicking a card opens a popup with a link to that agent's own detail
+        page — this page stays a summary, the depth lives one click away. */}
+    <AgentCarousel agents={report.agents} info={agentInfo} scanId={scanId} />
     <Footer />
     </>
   );
