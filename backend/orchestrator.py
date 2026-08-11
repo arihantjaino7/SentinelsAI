@@ -100,7 +100,11 @@ async def _check_reachable(url: str, client: httpx.AsyncClient) -> None:
 
 
 async def _finalize(
-    url: str, start: float, agent_results: list[AgentResult], subdomains: list | None = None
+    url: str,
+    start: float,
+    agent_results: list[AgentResult],
+    subdomains: list | None = None,
+    user_id: int | None = None,
 ) -> ScanReport:
     """Shared by both run functions: turn finished agent results into a report.
 
@@ -140,12 +144,17 @@ async def _finalize(
         checklist=checklist,
         subdomains=subdomains or [],
     )
-    save_scan(report)
+    save_scan(report, user_id=user_id)
     return report
 
 
-async def run_scan(raw_url: str) -> ScanReport:
-    """Normalize the URL, run every agent against it, assemble the report."""
+async def run_scan(raw_url: str, user_id: int | None = None) -> ScanReport:
+    """Normalize the URL, run every agent against it, assemble the report.
+
+    `user_id` (PLAN-v5 Stage 0) records who the scan belongs to. Optional, so
+    every existing caller and test keeps working and simply records an
+    unowned scan.
+    """
     url = normalize_url(raw_url)
     start = time.perf_counter()
 
@@ -156,11 +165,13 @@ async def run_scan(raw_url: str) -> ScanReport:
             *(agent_cls().run(context) for agent_cls in AGENTS)
         )
 
-    return await _finalize(url, start, list(agent_results), context.shared.get("subdomains"))
+    return await _finalize(
+        url, start, list(agent_results), context.shared.get("subdomains"), user_id
+    )
 
 
 async def run_scan_stream(
-    raw_url: str,
+    raw_url: str, user_id: int | None = None
 ) -> AsyncIterator[tuple[str, AgentResult | ScanReport]]:
     """Like `run_scan`, but yields progress instead of making the caller wait.
 
@@ -195,5 +206,7 @@ async def run_scan_stream(
             agent_results.append(result)
             yield ("agent", result)
 
-    report = await _finalize(url, start, agent_results, context.shared.get("subdomains"))
+    report = await _finalize(
+        url, start, agent_results, context.shared.get("subdomains"), user_id
+    )
     yield ("done", report)

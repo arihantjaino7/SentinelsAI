@@ -70,19 +70,43 @@ def update_checklist_item(scan_id: str, item_key: str, state: str, explanation: 
         conn.close()
 
 
-def list_scans(limit: int = 20, offset: int = 0) -> list[ScanSummary]:
-    """Return scan summaries, newest first."""
+def scan_owner(scan_id: str) -> int | None:
+    """Which user owns a scan, or None for the unowned ones.
+
+    None means two different things that callers treat identically: the scan
+    predates PLAN-v5 Stage 0 and has no owner, or there is no such scan. Both
+    end the same way — a 404 or a permitted read — so they aren't separated.
+    """
     conn = get_connection()
     try:
+        row = conn.execute("SELECT user_id FROM scans WHERE id = ?", (scan_id,)).fetchone()
+        return row["user_id"] if row is not None else None
+    finally:
+        conn.close()
+
+
+def list_scans(limit: int = 20, offset: int = 0, user_id: int | None = None) -> list[ScanSummary]:
+    """Return scan summaries, newest first.
+
+    `user_id` scopes the list to one person's scans plus every unowned one.
+    Unowned scans (`user_id IS NULL`) are the ones taken before Stage 0 added
+    identity — hiding them would make a working install look empty after an
+    upgrade, so they stay visible to everyone rather than being orphaned.
+    """
+    conn = get_connection()
+    try:
+        where = "" if user_id is None else "WHERE user_id = ? OR user_id IS NULL"
+        params: tuple = (limit, offset) if user_id is None else (user_id, limit, offset)
         rows = conn.execute(
-            """
+            f"""
             SELECT id, url, target_type, score, grade, scanned_at, duration_ms, summary,
                    readiness_score, deployment_status
             FROM scans
+            {where}
             ORDER BY created_at DESC
             LIMIT ? OFFSET ?
             """,
-            (limit, offset),
+            params,
         ).fetchall()
         return [
             ScanSummary(
@@ -198,22 +222,30 @@ def delete_scan(scan_id: str) -> bool:
         conn.close()
 
 
-def save_scan(report: ScanReport, repo_files: list[RepoFileEntry] | None = None) -> None:
+def save_scan(
+    report: ScanReport,
+    repo_files: list[RepoFileEntry] | None = None,
+    user_id: int | None = None,
+) -> None:
     """Persist a finished scan — the scan row, agent runs, findings, and
     checklist items — in a single transaction. `report.id` must already be
     set by the caller (`orchestrator._finalize` generates it).
 
     `repo_files` is additive and optional: only `repo_orchestrator._finalize`
-    ever passes it (R12), so the URL side's call site here never changes."""
+    ever passes it (R12), so the URL side's call site here never changes.
+
+    `user_id` is likewise additive (PLAN-v5 Stage 0) and defaults to None, so
+    every existing caller and test keeps working unchanged and simply records
+    an unowned scan."""
     conn = get_connection()
     try:
         conn.execute(
             """
             INSERT INTO scans (
                 id, url, target_type, scanned_at, duration_ms, score, grade,
-                summary, readiness_score, deployment_status, created_at
+                summary, readiness_score, deployment_status, created_at, user_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 report.id,
@@ -227,6 +259,7 @@ def save_scan(report: ScanReport, repo_files: list[RepoFileEntry] | None = None)
                 report.readiness_score,
                 report.deployment_status,
                 datetime.now(timezone.utc).isoformat(),
+                user_id,
             ),
         )
         save_agent_results(conn, report.id, report.agents)

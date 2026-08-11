@@ -220,6 +220,21 @@ class ChatMessage(BaseModel):
     created_at: str     # ISO 8601 UTC
 
 
+class User(BaseModel):
+    """One signed-in person, as Sentinels knows them (PLAN-v5 Stage 0).
+
+    Everything here comes from GitHub — Sentinels stores no password, no email,
+    and no OAuth token. The access token handed back during sign-in is used
+    once to read this identity and then discarded; what persists is only enough
+    to say "this scan is yours" and "this installation belongs to you".
+    """
+
+    id: int                              # our own row id, what other tables reference
+    github_id: int                       # GitHub's numeric id — stable across renames
+    github_login: str                    # the @handle — can change, so never a key
+    avatar_url: Optional[str] = None
+
+
 class RepoFileEntry(BaseModel):
     """One row of the file-tree browser for a repo scan (R12).
 

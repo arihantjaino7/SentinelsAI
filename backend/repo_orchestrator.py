@@ -65,6 +65,7 @@ async def _finalize(
     start: float,
     agent_results: list[AgentResult],
     repo_files: list[RepoFile] | None = None,
+    user_id: int | None = None,
 ) -> ScanReport:
     """Shared by `run_repo_scan` and `run_repo_scan_stream` — turn finished
     agent results into a persisted report. The repo-side sibling of
@@ -121,11 +122,11 @@ async def _finalize(
             for rf in repo_files
         ]
 
-    save_scan(report, repo_files=file_entries)
+    save_scan(report, repo_files=file_entries, user_id=user_id)
     return report
 
 
-async def run_repo_scan(raw_url: str) -> ScanReport:
+async def run_repo_scan(raw_url: str, user_id: int | None = None) -> ScanReport:
     """Parse a GitHub URL, fetch and walk the repo, run every repo agent
     against it, and assemble + persist the final report.
 
@@ -152,11 +153,11 @@ async def run_repo_scan(raw_url: str) -> ScanReport:
                 await asyncio.gather(*(agent_cls().run(context) for agent_cls in AGENTS_REPO))
             )
 
-    return await _finalize(raw_url, start, agent_results, context.files)
+    return await _finalize(raw_url, start, agent_results, context.files, user_id)
 
 
 async def run_repo_scan_stream(
-    raw_url: str,
+    raw_url: str, user_id: int | None = None
 ) -> AsyncIterator[tuple[str, AgentResult | ScanReport]]:
     """Like `run_repo_scan`, but yields progress instead of making the caller
     wait — the repo-side sibling of `orchestrator.run_scan_stream`.
@@ -194,5 +195,5 @@ async def run_repo_scan_stream(
                 agent_results.append(result)
                 yield ("agent", result)
 
-    report = await _finalize(raw_url, start, agent_results, context.files)
+    report = await _finalize(raw_url, start, agent_results, context.files, user_id)
     yield ("done", report)

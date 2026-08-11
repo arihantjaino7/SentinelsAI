@@ -163,6 +163,52 @@ CREATE TABLE subdomains (
 CREATE INDEX idx_subdomains_scan ON subdomains(scan_id);
 """
 
+# PLAN-v5 Stage 0: identity. Sentinels had no notion of "who" until now — fine
+# for a read-only scanner, not fine for something that can open pull requests on
+# your repositories. GitHub is the identity provider, so there are no passwords
+# here to hash, leak, or reset.
+#
+# `sessions` stores only a *hash* of the session token, never the token itself —
+# the same reason a password table stores hashes: a stolen copy of this database
+# yields nothing a thief can present as a valid cookie.
+#
+# `scans.user_id` is nullable on purpose. Every scan taken before this migration
+# has no owner and reads back as NULL, which is exactly what it always was:
+# unowned. Those stay readable rather than being orphaned or deleted.
+_V10_SCHEMA = """
+CREATE TABLE users (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    github_id    INTEGER NOT NULL UNIQUE,   -- GitHub's own numeric id, stable across renames
+    github_login TEXT NOT NULL,             -- the @handle, which CAN change
+    avatar_url   TEXT,
+    created_at   TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+
+CREATE TABLE sessions (
+    token_hash TEXT PRIMARY KEY,            -- sha256 of the cookie's token, never the token
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL                -- ISO 8601 UTC, checked on every request
+);
+CREATE INDEX idx_sessions_user ON sessions(user_id);
+
+CREATE TABLE github_installations (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    installation_id  INTEGER NOT NULL UNIQUE,
+    user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    account_login    TEXT NOT NULL,
+    repo_selection   TEXT NOT NULL,          -- "all" | "selected"
+    permissions_json TEXT NOT NULL DEFAULT '{}',
+    created_at       TEXT NOT NULL,
+    revoked_at       TEXT                    -- NULL while live
+);
+CREATE INDEX idx_installations_user ON github_installations(user_id);
+
+ALTER TABLE scans ADD COLUMN user_id INTEGER;
+ALTER TABLE scans ADD COLUMN commit_sha TEXT;
+"""
+
 # Each entry is (version, schema sql to apply to go from version-1 to version).
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _V1_SCHEMA),
@@ -174,6 +220,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (7, _V7_SCHEMA),
     (8, _V8_SCHEMA),
     (9, _V9_SCHEMA),
+    (10, _V10_SCHEMA),
 ]
 
 

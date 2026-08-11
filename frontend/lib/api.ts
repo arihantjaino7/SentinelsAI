@@ -131,6 +131,54 @@ export interface RepoFileEntry {
 // the app runs with no .env file present.
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
+/* PLAN-v5 Stage 0: every protected route now requires a session cookie. Two
+   small, shared pieces make that true everywhere without hand-editing every
+   fetch call below:
+
+   `withAuth(init)` merges in `credentials: "include"` — without it, the
+   browser never attaches the cookie to a cross-port request (localhost:3000
+   talking to localhost:8011 counts as cross-origin), and every call would
+   look like it's coming from a signed-out visitor no matter who's signed in.
+
+   `checkAuth(res)` is called right after every fetch below, before each
+   function's own status handling. A 401 means the session is missing or
+   expired — the one response every caller should react to the same way,
+   so it's handled once here instead of once per function. */
+
+function withAuth(init: RequestInit = {}): RequestInit {
+  return { ...init, credentials: "include" };
+}
+
+function checkAuth(res: Response): void {
+  if (res.status === 401 && typeof window !== "undefined") {
+    window.location.href = "/login";
+  }
+}
+
+export interface SessionUser {
+  id: number;
+  github_id: number;
+  github_login: string;
+  avatar_url: string | null;
+}
+
+/** Who the current session cookie belongs to, or null if signed out. */
+export async function fetchMe(): Promise<SessionUser | null> {
+  const res = await fetch(`${API_BASE}/auth/me`, withAuth());
+  if (!res.ok) return null;
+  return res.json() as Promise<SessionUser>;
+}
+
+/** Revoke the current session and clear its cookie. */
+export async function logout(): Promise<void> {
+  await fetch(`${API_BASE}/auth/logout`, withAuth({ method: "POST" }));
+}
+
+/** The URL to send the browser to for "Sign in with GitHub". */
+export function githubLoginUrl(): string {
+  return `${API_BASE}/auth/github/login`;
+}
+
 export interface ScanStreamHandlers {
   /** Called once per agent, the instant it finishes — real completion order. */
   onAgent: (result: AgentResult) => void;
@@ -151,8 +199,13 @@ export function streamScan(url: string, handlers: ScanStreamHandlers): () => voi
   // encodeURIComponent, not raw interpolation — url is user-typed text ending
   // up in a query string; without escaping, a stray "&" or "#" in it would
   // split the URL into extra query params instead of reaching the backend.
+  //
+  // { withCredentials: true } is EventSource's own equivalent of fetch's
+  // credentials: "include" — without it the session cookie never reaches
+  // this cross-port request either, and the stream 401s before the first event.
   const source = new EventSource(
     `${API_BASE}/scan/stream?url=${encodeURIComponent(url)}`,
+    { withCredentials: true },
   );
 
   source.addEventListener("agent", (event) => {
@@ -201,6 +254,7 @@ export function streamScan(url: string, handlers: ScanStreamHandlers): () => voi
 export function streamRepoScan(repoUrl: string, handlers: ScanStreamHandlers): () => void {
   const source = new EventSource(
     `${API_BASE}/repo/stream?url=${encodeURIComponent(repoUrl)}`,
+    { withCredentials: true },
   );
 
   source.addEventListener("agent", (event) => {
@@ -233,7 +287,9 @@ export function streamRepoScan(repoUrl: string, handlers: ScanStreamHandlers): (
 export async function fetchScan(scanId: string): Promise<ScanReport> {
   const res = await fetch(
     `${API_BASE}/scans/${encodeURIComponent(scanId)}`,
+    withAuth(),
   );
+  checkAuth(res);
   if (!res.ok) throw new Error(`Scan not found (${res.status})`);
   return res.json() as Promise<ScanReport>;
 }
@@ -246,7 +302,9 @@ export async function fetchChecklist(scanId: string): Promise<ChecklistItem[]> {
   try {
     const res = await fetch(
       `${API_BASE}/scans/${encodeURIComponent(scanId)}/checklist`,
+      withAuth(),
     );
+    checkAuth(res);
     if (!res.ok) return [];
     return res.json() as Promise<ChecklistItem[]>;
   } catch {
@@ -264,7 +322,9 @@ export async function fetchScanFiles(scanId: string): Promise<RepoFileEntry[]> {
   try {
     const res = await fetch(
       `${API_BASE}/scans/${encodeURIComponent(scanId)}/files`,
+      withAuth(),
     );
+    checkAuth(res);
     if (!res.ok) return [];
     return res.json() as Promise<RepoFileEntry[]>;
   } catch {
@@ -284,12 +344,13 @@ export async function answerChecklistItem(
 ): Promise<ChecklistItem> {
   const res = await fetch(
     `${API_BASE}/scans/${encodeURIComponent(scanId)}/checklist/${encodeURIComponent(itemKey)}`,
-    {
+    withAuth({
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ state, explanation: explanation ?? "" }),
-    },
+    }),
   );
+  checkAuth(res);
   if (!res.ok) throw new Error(`Failed to update checklist item (${res.status})`);
   return res.json() as Promise<ChecklistItem>;
 }
@@ -322,7 +383,8 @@ export async function fetchFix(
   regenerate = false,
 ): Promise<FixSuggestion> {
   const url = `${API_BASE}/scans/${encodeURIComponent(scanId)}/findings/${encodeURIComponent(findingKey)}/fix${regenerate ? "?regenerate=true" : ""}`;
-  const res = await fetch(url, { method: "POST" });
+  const res = await fetch(url, withAuth({ method: "POST" }));
+  checkAuth(res);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error((body as { detail?: string }).detail ?? `Fix unavailable (${res.status})`);
@@ -338,11 +400,12 @@ export async function postChatMessage(
   scanId: string,
   question: string,
 ): Promise<ChatMessage> {
-  const res = await fetch(`${API_BASE}/scans/${encodeURIComponent(scanId)}/chat`, {
+  const res = await fetch(`${API_BASE}/scans/${encodeURIComponent(scanId)}/chat`, withAuth({
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ question }),
-  });
+  }));
+  checkAuth(res);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error((body as { detail?: string }).detail ?? `Chat unavailable (${res.status})`);
@@ -356,7 +419,8 @@ export async function postChatMessage(
  */
 export async function fetchChatHistory(scanId: string): Promise<ChatMessage[]> {
   try {
-    const res = await fetch(`${API_BASE}/scans/${encodeURIComponent(scanId)}/chat`);
+    const res = await fetch(`${API_BASE}/scans/${encodeURIComponent(scanId)}/chat`, withAuth());
+    checkAuth(res);
     if (!res.ok) return [];
     return res.json() as Promise<ChatMessage[]>;
   } catch {
@@ -371,11 +435,12 @@ export async function fetchChatHistory(scanId: string): Promise<ChatMessage[]> {
  * on screen (see the endpoint's docstring in `backend/main.py`).
  */
 export async function downloadReportPdf(report: ScanReport): Promise<void> {
-  const response = await fetch(`${API_BASE}/scan/pdf`, {
+  const response = await fetch(`${API_BASE}/scan/pdf`, withAuth({
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(report),
-  });
+  }));
+  checkAuth(response);
 
   if (!response.ok) {
     throw new Error(`PDF export failed (${response.status})`);

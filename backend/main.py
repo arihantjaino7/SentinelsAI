@@ -13,10 +13,12 @@ import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+import secrets
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 # Loads backend/.env into the process's environment (GROQ_API_KEY, if
@@ -31,8 +33,27 @@ from ai.chat import answer as chat_answer  # noqa: E402
 from ai.client import get_api_key  # noqa: E402
 from ai.fixes import get_or_generate_fix  # noqa: E402
 from ai.prompts import PROMPT_VERSION  # noqa: E402
+from auth.deps import current_user  # noqa: E402
+from auth.github_oauth import (  # noqa: E402
+    authorize_url,
+    exchange_code,
+    fetch_identity,
+    get_frontend_origin,
+    missing_settings,
+    oauth_configured,
+)
+from auth.session import (  # noqa: E402
+    COOKIE_NAME,
+    SESSION_TTL,
+    cookie_value,
+    get_session_secret,
+    hash_token,
+    new_token,
+    session_expiry,
+    token_from_cookie,
+)
 from db import init_db  # noqa: E402
-from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixSuggestion, RepoFileEntry, ScanReport, ScanRequest, ScanSummary  # noqa: E402
+from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixSuggestion, RepoFileEntry, ScanReport, ScanRequest, ScanSummary, User  # noqa: E402
 from orchestrator import run_scan, run_scan_stream  # noqa: E402
 from repo_orchestrator import run_repo_scan, run_repo_scan_stream  # noqa: E402
 from report.pdf import generate_pdf  # noqa: E402
@@ -40,7 +61,8 @@ from report.registry import get_exporter, list_formats  # noqa: E402
 from storage.chat import load_messages  # noqa: E402
 from storage.fixes import load_fixes_for_scan  # noqa: E402
 from storage.repo_files import get_repo_files  # noqa: E402
-from storage.scans import delete_scan, get_scan, list_scans, update_checklist_item  # noqa: E402
+from storage.scans import delete_scan, get_scan, list_scans, scan_owner, update_checklist_item  # noqa: E402
+from storage.users import delete_session, sign_in  # noqa: E402
 
 # Creates backend/data/sentinels.db and brings its schema up to date if it
 # isn't already — safe to call on every startup (see db.init_db's docstring).
@@ -64,11 +86,30 @@ app = FastAPI(
 # a wildcard would let a page on *any* site drive this API using the visitor's
 # machine as the source of the scan traffic. For a tool that makes outbound
 # requests to third-party sites, that's a genuinely bad default to ship.
+#
+# allow_credentials=True (PLAN-v5 Stage 0) is what lets the browser attach the
+# session cookie to a cross-port request at all — without it the cookie is
+# silently dropped and every protected route looks like it's rejecting a
+# signed-in user. The two are a package deal in the CORS spec: a wildcard
+# origin and allow_credentials cannot be combined, which is one more reason
+# the explicit two-origin list above was already the right call.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type"],
+    allow_credentials=True,
+)
+
+# Cookie flags shared by both the login and logout responses, so the two can
+# never drift apart — a cookie set with one set of flags and cleared with
+# another can end up not actually clearing (the browser treats "same name,
+# different path/attrs" as a different cookie).
+_COOKIE_KWARGS = dict(
+    key=COOKIE_NAME,
+    httponly=True,       # invisible to page JavaScript — an XSS bug can't read it
+    samesite="lax",      # sent on top-level navigation, not on cross-site POSTs
+    path="/",
 )
 
 
@@ -94,8 +135,111 @@ def health() -> dict:
     }
 
 
+@app.get("/auth/github/login")
+def auth_login(request: Request) -> RedirectResponse:
+    """Send the browser to GitHub to sign in.
+
+    The `state` value is round-tripped through the cookie itself rather than
+    server-side session storage — there's no session yet to store it in, this
+    is how one gets created. It's a plain httponly cookie, short-lived enough
+    (10 minutes) that it only ever needs to survive the trip to github.com and
+    back.
+    """
+    if not oauth_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=f"GitHub sign-in is not configured. Missing: {', '.join(missing_settings())}.",
+        )
+    state = secrets.token_urlsafe(24)
+    redirect_uri = str(request.url_for("auth_callback"))
+    response = RedirectResponse(authorize_url(state, redirect_uri))
+    response.set_cookie(
+        "sentinels_oauth_state", state, httponly=True, samesite="lax", max_age=600, path="/",
+    )
+    return response
+
+
+@app.get("/auth/github/callback")
+async def auth_callback(request: Request, code: str = "", state: str = "") -> RedirectResponse:
+    """GitHub's landing point after the user approves (or denies) sign-in.
+
+    Trades `code` for a token, reads the identity it belongs to, opens a
+    session, and sends the browser back to the app with the session cookie
+    set. Every failure path redirects to the frontend's login page with a
+    `?error=` instead of showing a bare API error page — the user is on a
+    browser tab, not a curl session.
+    """
+    frontend = get_frontend_origin()
+    expected_state = request.cookies.get("sentinels_oauth_state")
+
+    def _fail(reason: str) -> RedirectResponse:
+        return RedirectResponse(f"{frontend}/login?error={reason}")
+
+    if not expected_state or state != expected_state:
+        return _fail("state_mismatch")
+    if not code:
+        return _fail("missing_code")
+
+    secret = get_session_secret()
+    if secret is None:
+        return _fail("server_not_configured")
+
+    redirect_uri = str(request.url_for("auth_callback"))
+    token = await exchange_code(code, redirect_uri)
+    if token is None:
+        return _fail("exchange_failed")
+
+    identity = await fetch_identity(token)
+    if identity is None:
+        return _fail("identity_failed")
+
+    session_token = new_token()
+    sign_in(
+        github_id=identity.github_id,
+        github_login=identity.login,
+        avatar_url=identity.avatar_url,
+        token_hash=hash_token(session_token),
+        expires_at=session_expiry(),
+    )
+
+    response = RedirectResponse(frontend)
+    response.delete_cookie("sentinels_oauth_state", path="/")
+    response.set_cookie(
+        value=cookie_value(session_token, secret),
+        max_age=int(SESSION_TTL.total_seconds()),
+        **_COOKIE_KWARGS,
+    )
+    return response
+
+
+@app.get("/auth/me", response_model=User)
+def auth_me(user: User = Depends(current_user)) -> User:
+    """Who the current session cookie belongs to."""
+    return user
+
+
+@app.post("/auth/logout")
+def auth_logout(request: Request) -> Response:
+    """Revoke the current session and clear its cookie.
+
+    Deletes the session row (not just the cookie) so the exact bytes sitting
+    in a browser's cookie jar stop working immediately, rather than merely
+    being politely asked not to send them again.
+    """
+    secret = get_session_secret()
+    raw = request.cookies.get(COOKIE_NAME)
+    if raw and secret:
+        token = token_from_cookie(raw, secret)
+        if token:
+            delete_session(hash_token(token))
+
+    response = Response(status_code=204)
+    response.delete_cookie(**_COOKIE_KWARGS)
+    return response
+
+
 @app.post("/scan", response_model=ScanReport)
-async def scan(request: ScanRequest) -> ScanReport:
+async def scan(request: ScanRequest, user: User = Depends(current_user)) -> ScanReport:
     """Run a full scan against `request.url` and return the report.
 
     `async def` here (unlike `/health`'s plain `def`) because this endpoint
@@ -103,7 +247,7 @@ async def scan(request: ScanRequest) -> ScanReport:
     the agents it calls.
     """
     try:
-        return await run_scan(request.url)
+        return await run_scan(request.url, user_id=user.id)
     except ValueError as exc:
         # normalize_url's complaints (empty string, bad scheme, no host) are
         # the client's fault, not the server's — 400, not a 500 crash.
@@ -111,7 +255,7 @@ async def scan(request: ScanRequest) -> ScanReport:
 
 
 @app.post("/repo/scan", response_model=ScanReport)
-async def repo_scan(request: ScanRequest) -> ScanReport:
+async def repo_scan(request: ScanRequest, user: User = Depends(current_user)) -> ScanReport:
     """Run a full scan against a public GitHub repo (`request.url`) and
     return the report. The repo-side sibling of `POST /scan` -- same
     request/response shape, same 400-on-ValueError contract, a different
@@ -124,7 +268,7 @@ async def repo_scan(request: ScanRequest) -> ScanReport:
     every other milestone in this codebase has been.
     """
     try:
-        return await run_repo_scan(request.url)
+        return await run_repo_scan(request.url, user_id=user.id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -137,7 +281,7 @@ def _sse(event: str, data: str) -> str:
 
 
 @app.get("/scan/stream")
-async def scan_stream(url: str) -> StreamingResponse:
+async def scan_stream(url: str, user: User = Depends(current_user)) -> StreamingResponse:
     """Same scan as `POST /scan`, reported as it happens instead of all at
     once. Server-Sent Events, not JSON — a one-way, GET-only, plain-text
     streaming protocol the browser understands natively via `EventSource`,
@@ -151,11 +295,15 @@ async def scan_stream(url: str) -> StreamingResponse:
     the status code (200) is already committed — so it's reported as
     `event: failed` instead, a message *inside* the otherwise-successful
     stream.
+
+    `Depends(current_user)` runs — and can 401 — before this function body
+    starts, so an unauthenticated `EventSource` never gets as far as opening
+    the stream.
     """
 
     async def events():
         try:
-            async for event_name, payload in run_scan_stream(url):
+            async for event_name, payload in run_scan_stream(url, user_id=user.id):
                 yield _sse(event_name, payload.model_dump_json())
         except ValueError as exc:
             yield _sse("failed", json.dumps({"detail": str(exc)}))
@@ -168,7 +316,7 @@ async def scan_stream(url: str) -> StreamingResponse:
 
 
 @app.get("/repo/stream")
-async def repo_scan_stream(url: str) -> StreamingResponse:
+async def repo_scan_stream(url: str, user: User = Depends(current_user)) -> StreamingResponse:
     """Same repo scan as `POST /repo/scan`, reported as it happens instead of
     all at once. The repo-side sibling of `GET /scan/stream` -- same SSE
     shape (`event: agent` per finished agent, one `event: done` at the end,
@@ -179,7 +327,7 @@ async def repo_scan_stream(url: str) -> StreamingResponse:
 
     async def events():
         try:
-            async for event_name, payload in run_repo_scan_stream(url):
+            async for event_name, payload in run_repo_scan_stream(url, user_id=user.id):
                 yield _sse(event_name, payload.model_dump_json())
         except ValueError as exc:
             yield _sse("failed", json.dumps({"detail": str(exc)}))
@@ -204,14 +352,21 @@ def repo_agents_list() -> list[AgentInfo]:
 
 
 @app.get("/scans", response_model=list[ScanSummary])
-def scans_list(limit: int = 20, offset: int = 0) -> list[ScanSummary]:
-    """List stored scans, newest first. Paginate with `limit` and `offset`."""
+def scans_list(
+    limit: int = 20, offset: int = 0, user: User = Depends(current_user)
+) -> list[ScanSummary]:
+    """List stored scans, newest first. Paginate with `limit` and `offset`.
+
+    Scoped to the caller's own scans plus every unowned (pre-Stage-0) one —
+    see `storage.scans.list_scans`'s docstring for why unowned scans stay
+    visible rather than disappearing after an upgrade.
+    """
     limit = min(max(limit, 1), 100)
-    return list_scans(limit=limit, offset=offset)
+    return list_scans(limit=limit, offset=offset, user_id=user.id)
 
 
 @app.get("/scans/{scan_id}", response_model=ScanReport)
-def scans_get(scan_id: str) -> ScanReport:
+def scans_get(scan_id: str, user: User = Depends(current_user)) -> ScanReport:
     """Return the full stored ScanReport for `scan_id`."""
     report = get_scan(scan_id)
     if report is None:
@@ -220,7 +375,7 @@ def scans_get(scan_id: str) -> ScanReport:
 
 
 @app.get("/scans/{scan_id}/agents/{agent_name}", response_model=AgentResult)
-def scans_agent_get(scan_id: str, agent_name: str) -> AgentResult:
+def scans_agent_get(scan_id: str, agent_name: str, user: User = Depends(current_user)) -> AgentResult:
     """Return one agent's result slice from a stored scan.
 
     Used by the per-agent detail page so it only fetches what it needs instead
@@ -239,7 +394,7 @@ def scans_agent_get(scan_id: str, agent_name: str) -> AgentResult:
 
 
 @app.get("/scans/{scan_id}/files", response_model=list[RepoFileEntry])
-def scans_files_get(scan_id: str) -> list[RepoFileEntry]:
+def scans_files_get(scan_id: str, user: User = Depends(current_user)) -> list[RepoFileEntry]:
     """Return the file tree (path, size, language, finding count) for a repo
     scan. Empty for a URL scan — `target_type` is what the frontend checks
     before ever calling this, but an empty list is also a perfectly valid
@@ -252,15 +407,25 @@ def scans_files_get(scan_id: str) -> list[RepoFileEntry]:
 
 
 @app.delete("/scans/{scan_id}")
-def scans_delete(scan_id: str) -> Response:
-    """Delete a scan and all its findings. Returns 204 on success, 404 if not found."""
+def scans_delete(scan_id: str, user: User = Depends(current_user)) -> Response:
+    """Delete a scan and all its findings. Returns 204 on success, 404 if not found.
+
+    Ownership is checked here, not just sign-in: deletion is destructive and
+    permanent, so a scan someone else owns returns 403 rather than being
+    silently deletable by anyone who is merely signed in. Unowned (legacy)
+    scans have no owner to protect and stay deletable by any signed-in user,
+    matching how `list_scans` already treats them as shared.
+    """
+    owner = scan_owner(scan_id)
+    if owner is not None and owner != user.id:
+        raise HTTPException(status_code=403, detail="This scan belongs to another user.")
     if not delete_scan(scan_id):
         raise HTTPException(status_code=404, detail=f"Scan {scan_id!r} not found")
     return Response(status_code=204)
 
 
 @app.get("/scans/{scan_id}/checklist", response_model=list[ChecklistItem])
-def checklist_get(scan_id: str) -> list[ChecklistItem]:
+def checklist_get(scan_id: str, user: User = Depends(current_user)) -> list[ChecklistItem]:
     """Return the deployment checklist for a stored scan."""
     report = get_scan(scan_id)
     if report is None:
@@ -274,7 +439,9 @@ class ChecklistAnswer(BaseModel):
 
 
 @app.post("/scans/{scan_id}/checklist/{item_key}", response_model=ChecklistItem)
-def checklist_answer(scan_id: str, item_key: str, body: ChecklistAnswer) -> ChecklistItem:
+def checklist_answer(
+    scan_id: str, item_key: str, body: ChecklistAnswer, user: User = Depends(current_user)
+) -> ChecklistItem:
     """Update a self-attested checklist item's state.
 
     Only self_attested items are writable — auto and inferred items are computed
@@ -305,7 +472,7 @@ def checklist_answer(scan_id: str, item_key: str, body: ChecklistAnswer) -> Chec
 
 @app.post("/scans/{scan_id}/findings/{finding_key}/fix", response_model=FixSuggestion)
 async def finding_fix(
-    scan_id: str, finding_key: str, regenerate: bool = False
+    scan_id: str, finding_key: str, regenerate: bool = False, user: User = Depends(current_user)
 ) -> FixSuggestion:
     """Return an AI-generated fix suggestion for one finding (cached).
 
@@ -338,7 +505,7 @@ class ChatQuestion(BaseModel):
 
 
 @app.post("/scans/{scan_id}/chat", response_model=ChatMessage)
-async def chat_post(scan_id: str, body: ChatQuestion) -> ChatMessage:
+async def chat_post(scan_id: str, body: ChatQuestion, user: User = Depends(current_user)) -> ChatMessage:
     """Ask one question about a completed scan.
 
     Persists both the user question and the assistant answer to the DB so the
@@ -362,7 +529,7 @@ async def chat_post(scan_id: str, body: ChatQuestion) -> ChatMessage:
 
 
 @app.get("/scans/{scan_id}/chat", response_model=list[ChatMessage])
-def chat_history(scan_id: str) -> list[ChatMessage]:
+def chat_history(scan_id: str, user: User = Depends(current_user)) -> list[ChatMessage]:
     """Return the full conversation history for a scan, oldest first."""
     report = get_scan(scan_id)
     if report is None:
@@ -377,7 +544,7 @@ def export_formats() -> list[dict[str, str]]:
 
 
 @app.get("/scans/{scan_id}/export/{format_id}")
-async def scan_export(scan_id: str, format_id: str) -> Response:
+async def scan_export(scan_id: str, format_id: str, user: User = Depends(current_user)) -> Response:
     """Export a stored scan in the given format (pdf | json | markdown).
 
     Looks up any cached AI fix suggestions for the scan and passes them to
@@ -408,7 +575,7 @@ async def scan_export(scan_id: str, format_id: str) -> Response:
 
 
 @app.post("/scan/pdf")
-async def scan_pdf(report: ScanReport) -> Response:
+async def scan_pdf(report: ScanReport, user: User = Depends(current_user)) -> Response:
     """Deprecated alias — kept through M17 per PLAN-v2.md, then removed.
 
     Prints a *finished* report to PDF, taking the whole `ScanReport` as the
