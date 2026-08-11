@@ -35,11 +35,34 @@ const HALF = Math.floor(VISIBLE_COUNT / 2); // 2
 
 // The ring's reach is a fraction of the track's own measured width rather
 // than a fixed pixel count, via ResizeObserver below — so a phone-width
-// track gets a phone-width ring instead of overflowing it.
+// track gets a phone-width ring, and a widescreen monitor gets a wide one,
+// instead of the ring capping out small while empty margin grows around it.
 const MIN_RADIUS_X = 110;
-const MAX_RADIUS_X = 240;
-const RADIUS_X_RATIO = 0.34;
+const MAX_RADIUS_X = 520;
+const RADIUS_X_RATIO = 0.36;
 const RADIUS_Y_RATIO = 0.45; // a shallow arc, not a full circle
+
+// Card size is likewise derived from the measured radius rather than fixed
+// per breakpoint, so it grows continuously with the ring instead of jumping
+// at sm/lg — a 2000px monitor and a 1300px laptop both get a card sized to
+// what their own ring actually has room for.
+const MIN_CARD_WIDTH = 170;
+// Capped rather than left to `radius.x * CARD_WIDTH_RATIO`: past roughly this
+// width the outermost pair starts running out of track to sit in, and the
+// active card overlaps its neighbours far enough to bury their titles.
+const MAX_CARD_WIDTH = 370;
+const CARD_WIDTH_RATIO = 0.95; // vs. radiusX
+const CARD_ASPECT = 0.66; // height / width
+const TRACK_PADDING = 40; // headroom above/below the arc so cards never clip
+
+// The visible cards only ride the TOP of the ellipse: `ringPosition` puts the
+// active card at -radiusY and the outermost pair at -cos(72°)·radiusY, so the
+// arc's real vertical extent is far shorter than the full `radiusY * 2` of the
+// ellipse it's cut from. These two constants re-derive the outermost card's
+// angle and scale from the same numbers `ringPosition` uses, so the measured
+// extent can never drift from where the cards are actually drawn.
+const EDGE_ANGLE = (HALF / VISIBLE_COUNT) * Math.PI;
+const EDGE_SCALE = 1 - (HALF / (HALF + 1)) * 0.3;
 
 interface RingGeometry {
   x: number;
@@ -145,6 +168,32 @@ export function AgentCarousel({
     return () => observer.disconnect();
   }, []);
 
+  // Card size and the track's own height both fall out of the same radius
+  // reading, so the arc and the cards riding it scale as one thing rather
+  // than the ring changing size independently of what sits on it.
+  const cardWidth = Math.min(
+    MAX_CARD_WIDTH,
+    Math.max(MIN_CARD_WIDTH, radius.x * CARD_WIDTH_RATIO),
+  );
+  const cardHeight = cardWidth * CARD_ASPECT;
+
+  /* The arc's true top and bottom edges, measured from the track's centre.
+     The top is the active card (angle 0, full scale); the bottom is the
+     outermost visible pair, which sits much higher than +radiusY and is
+     scaled down as well. Sizing the track to `radiusY * 2` instead — as this
+     did originally — left a dead band roughly 275px tall under the lowest
+     card, which is what pushed the controls so far from the ring. */
+  const arcTop = -radius.y - cardHeight / 2;
+  const arcBottom =
+    -Math.cos(EDGE_ANGLE) * radius.y + (cardHeight * EDGE_SCALE) / 2;
+  const trackHeight = arcBottom - arcTop + TRACK_PADDING;
+
+  /* CSS centres each card on the track (`top-1/2 -translate-y-1/2`), but the
+     arc is not centred on itself — it hangs above the origin. Without this
+     the whole ring would hug the track's top edge and re-open the same gap
+     underneath that shrinking the track just closed. */
+  const arcYOffset = -(arcTop + arcBottom) / 2;
+
   // A re-scan could in principle change how many agents come back. Rather
   // than an effect that notices `activeIndex` is out of range and issues a
   // second setState to correct it — a cascading render — the same modulo
@@ -183,142 +232,163 @@ export function AgentCarousel({
       tabIndex={0}
       role="region"
       aria-label="Agents"
-      className="mx-auto mt-20 flex max-w-3xl flex-col items-center gap-8 px-6 pb-24 outline-none"
+      // max-w-7xl + w-full matches the article container above it exactly
+      // (page.tsx:179) — the carousel used to be capped at max-w-3xl, far
+      // narrower than the rest of the report. `w-full` is load-bearing, not
+      // decorative: this section is a flex item inside the scan layout's
+      // `flex flex-col` wrapper, and `mx-auto`'s auto side-margins override
+      // flexbox's default stretch behaviour, collapsing the section to its
+      // shrink-to-fit content width unless something forces it to 100% first.
+      className="mx-auto mt-20 flex w-full max-w-7xl flex-col items-center gap-8 px-6 pb-24 outline-none sm:px-8"
     >
-      <h2 className="self-start font-mono text-xs uppercase tracking-[0.3em] text-muted">
+      <h2 className="self-start font-mono text-[40px] uppercase tracking-[0.3em] text-muted">
         Agents
       </h2>
 
-      <motion.div
-        ref={trackRef}
-        drag="x"
-        dragConstraints={{ left: 0, right: 0 }}
-        dragElastic={reduceMotion ? 0 : 0.18}
-        dragMomentum={false}
-        onDragEnd={(_, dragInfo) => {
-          if (dragInfo.offset.x < -50) next();
-          else if (dragInfo.offset.x > 50) prev();
-        }}
-        className="relative h-56 w-full cursor-grab touch-pan-y active:cursor-grabbing sm:h-64"
-      >
-        <AnimatePresence mode="popLayout">
-          {ordered.map((result, index) => {
-            const pos = ringPosition(index, safeIndex, total, radius.x, radius.y);
-            if (!pos) return null;
+      {/* Track and controls are grouped in their own tighter flex column so
+          the slide buttons sit close under the cards — only the heading
+          keeps the section's wider `gap-8` above this group. */}
+      <div className="flex w-full flex-col items-center gap-3">
+        <motion.div
+          ref={trackRef}
+          drag="x"
+          dragConstraints={{ left: 0, right: 0 }}
+          dragElastic={reduceMotion ? 0 : 0.18}
+          dragMomentum={false}
+          onDragEnd={(_, dragInfo) => {
+            if (dragInfo.offset.x < -50) next();
+            else if (dragInfo.offset.x > 50) prev();
+          }}
+          // Height is computed, not a fixed/breakpoint class — it has to grow
+          // in lockstep with `radius.y` and `cardHeight` above, or the arc
+          // widening on a big screen would just clip the top/bottom rows.
+          style={{ height: trackHeight }}
+          className="relative w-full cursor-grab touch-pan-y active:cursor-grabbing"
+        >
+          <AnimatePresence mode="popLayout">
+            {ordered.map((result, index) => {
+              const pos = ringPosition(index, safeIndex, total, radius.x, radius.y);
+              if (!pos) return null;
 
-            const isActive = index === safeIndex;
-            const agentMeta = metaFor(result.agent);
+              const isActive = index === safeIndex;
+              const agentMeta = metaFor(result.agent);
 
-            return (
-              <motion.button
-                key={result.agent}
-                type="button"
-                initial={{ opacity: 0, scale: 0.8 }}
-                animate={{
-                  x: pos.x,
-                  y: pos.y,
-                  scale: pos.scale,
-                  opacity: pos.opacity,
-                  zIndex: pos.zIndex,
-                }}
-                exit={{ opacity: 0, scale: 0.8 }}
-                transition={
-                  reduceMotion
-                    ? { duration: 0.01 }
-                    : { duration: 0.65, ease: [0.22, 1, 0.36, 1] }
-                }
-                onClick={() => {
-                  setActiveIndex(index);
-                  setPeekAgent(result);
-                }}
-                aria-label={`${agentMeta?.display_name ?? result.agent} — ${statusLabel(result)}`}
-                aria-current={isActive ? "true" : undefined}
-                className={`glass absolute left-1/2 top-1/2 flex h-28 w-40 -translate-x-1/2 -translate-y-1/2 flex-col items-start justify-between rounded-2xl p-4 text-left transition-shadow duration-300 sm:h-32 sm:w-48 ${
-                  isActive
-                    ? "border-parchment/25 shadow-[0_20px_60px_-12px_rgba(0,0,0,0.55)]"
-                    : "shadow-[0_8px_24px_-4px_rgba(0,0,0,0.35)] hover:border-parchment/15"
-                }`}
-                style={{ transformOrigin: "center center" }}
-              >
-                <span
-                  className={`font-mono text-[10px] uppercase tracking-[0.2em] ${
-                    result.error ? "text-critical" : "text-muted"
+              return (
+                <motion.button
+                  key={result.agent}
+                  type="button"
+                  initial={{ opacity: 0, scale: 0.8 }}
+                  animate={{
+                    x: pos.x,
+                    y: pos.y + arcYOffset,
+                    scale: pos.scale,
+                    opacity: pos.opacity,
+                    zIndex: pos.zIndex,
+                  }}
+                  exit={{ opacity: 0, scale: 0.8 }}
+                  transition={
+                    reduceMotion
+                      ? { duration: 0.01 }
+                      : { duration: 0.65, ease: [0.22, 1, 0.36, 1] }
+                  }
+                  onClick={() => {
+                    setActiveIndex(index);
+                    setPeekAgent(result);
+                  }}
+                  aria-label={`${agentMeta?.display_name ?? result.agent} — ${statusLabel(result)}`}
+                  aria-current={isActive ? "true" : undefined}
+                  className={`glass absolute left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 flex-col items-start justify-between rounded-2xl p-4 text-left transition-shadow duration-300 ${
+                    isActive
+                      ? "border-parchment/25 shadow-[0_20px_60px_-12px_rgba(0,0,0,0.55)]"
+                      : "shadow-[0_8px_24px_-4px_rgba(0,0,0,0.35)] hover:border-parchment/15"
                   }`}
+                  // Width/height ride the same computed size as the track
+                  // (see `cardWidth`/`cardHeight` above) instead of a fixed
+                  // breakpoint class, so cards scale continuously with the ring.
+                  style={{
+                    width: cardWidth,
+                    height: cardHeight,
+                    transformOrigin: "center center",
+                  }}
                 >
-                  {statusLabel(result)}
-                </span>
-                <div>
-                  <h3
-                    className={`font-display leading-tight ${
-                      isActive ? "text-base text-parchment" : "text-sm text-parchment/80"
+                  <span
+                    className={`font-mono text-[11px] uppercase tracking-[0.2em] ${
+                      result.error ? "text-critical" : "text-muted"
                     }`}
                   >
-                    {agentMeta?.display_name ?? result.agent}
-                  </h3>
-                  <p className="mt-1 font-mono text-[10px] uppercase tracking-[0.15em] text-muted">
-                    {agentMeta?.category ?? result.agent}
-                  </p>
-                </div>
-              </motion.button>
-            );
-          })}
-        </AnimatePresence>
-
-        {/* Anchored inside the track, not the whole section — the section
-            also contains the controls row below, and this used to sit on
-            top of that too (see AgentCarousel's note above and the plan's
-            bug list). */}
-        <motion.div
-          key={activeAgent.agent}
-          initial={{ opacity: 0, y: 8 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: reduceMotion ? 0.01 : 0.4, ease: "easeOut" }}
-          className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center"
-        >
-          <span className="font-display text-5xl leading-none text-parchment/90">
-            {String(safeIndex + 1).padStart(2, "0")}
-          </span>
-          <span className="mt-1 font-mono text-xs text-muted">
-            of {String(total).padStart(2, "0")}
-          </span>
+                    {statusLabel(result)}
+                  </span>
+                  <div>
+                    <h3
+                      className={`font-display leading-tight ${
+                        isActive ? "text-lg text-parchment" : "text-[15px] text-parchment/80"
+                      }`}
+                    >
+                      {agentMeta?.display_name ?? result.agent}
+                    </h3>
+                    <p className="mt-1 font-mono text-[11px] uppercase tracking-[0.15em] text-muted">
+                      {agentMeta?.category ?? result.agent}
+                    </p>
+                  </div>
+                </motion.button>
+              );
+            })}
+          </AnimatePresence>
         </motion.div>
-      </motion.div>
 
-      <div className="flex items-center gap-4">
-        <button
-          type="button"
-          onClick={prev}
-          aria-label="Previous agent"
-          className="glass flex h-10 w-10 items-center justify-center rounded-full text-muted transition-colors hover:text-parchment"
-        >
-          <Chevron direction="left" />
-        </button>
+        {/* The "03 of 08" counter used to float inside the ring; it now sits
+            directly above the slide buttons instead, so the numbering and the
+            controls that change it read as one group rather than two things
+            separated by the whole height of the track. */}
+        <div className="flex flex-col items-center gap-2">
+          <motion.p
+            key={activeAgent.agent}
+            initial={{ opacity: 0, y: 4 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: reduceMotion ? 0.01 : 0.3, ease: "easeOut" }}
+            className="font-mono text-xs text-muted"
+          >
+            <span className="text-parchment/90">{String(safeIndex + 1).padStart(2, "0")}</span>
+            {" "}of {String(total).padStart(2, "0")}
+          </motion.p>
 
-        <div className="flex items-center gap-1.5">
-          {ordered.map((result, i) => (
+          <div className="flex items-center gap-3">
             <button
-              key={result.agent}
               type="button"
-              onClick={() => goTo(i)}
-              aria-label={`Go to ${metaFor(result.agent)?.display_name ?? result.agent}`}
-              aria-current={i === safeIndex ? "true" : undefined}
-              className={`h-1.5 rounded-full transition-all duration-300 ${
-                i === safeIndex
-                  ? "w-6 bg-parchment/80"
-                  : "w-1.5 bg-parchment/20 hover:bg-parchment/40"
-              }`}
-            />
-          ))}
-        </div>
+              onClick={prev}
+              aria-label="Previous agent"
+              className="glass flex h-10 w-10 items-center justify-center rounded-full text-muted transition-colors hover:text-parchment"
+            >
+              <Chevron direction="left" />
+            </button>
 
-        <button
-          type="button"
-          onClick={next}
-          aria-label="Next agent"
-          className="glass flex h-10 w-10 items-center justify-center rounded-full text-muted transition-colors hover:text-parchment"
-        >
-          <Chevron direction="right" />
-        </button>
+            <div className="flex items-center gap-1.5">
+              {ordered.map((result, i) => (
+                <button
+                  key={result.agent}
+                  type="button"
+                  onClick={() => goTo(i)}
+                  aria-label={`Go to ${metaFor(result.agent)?.display_name ?? result.agent}`}
+                  aria-current={i === safeIndex ? "true" : undefined}
+                  className={`h-1.5 rounded-full transition-all duration-300 ${
+                    i === safeIndex
+                      ? "w-6 bg-parchment/80"
+                      : "w-1.5 bg-parchment/20 hover:bg-parchment/40"
+                  }`}
+                />
+              ))}
+            </div>
+
+            <button
+              type="button"
+              onClick={next}
+              aria-label="Next agent"
+              className="glass flex h-10 w-10 items-center justify-center rounded-full text-muted transition-colors hover:text-parchment"
+            >
+              <Chevron direction="right" />
+            </button>
+          </div>
+        </div>
       </div>
 
       <AgentPeekDialog
