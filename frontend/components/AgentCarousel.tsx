@@ -18,7 +18,7 @@ import { AgentPeekDialog } from "@/components/AgentPeekDialog";
    *signed* distance from the active card:
 
      d = shortest-arc(index - activeIndex, total)
-     angle = (d / VISIBLE_COUNT) * π
+     angle = (d / visibleCount) * π
      x = sin(angle) * radiusX      y = -cos(angle) * radiusY
 
    The "shortest signed distance" part matters at 8 items. A naive
@@ -30,8 +30,15 @@ import { AgentPeekDialog } from "@/components/AgentPeekDialog";
    same trick a clock face uses to say "11 o'clock is one hour before 12,
    not eleven hours after it". */
 
-const VISIBLE_COUNT = 5; // cards visible at once: the active one + two either side
-const HALF = Math.floor(VISIBLE_COUNT / 2); // 2
+/* How many cards ride the arc at once. Five is the desktop look, but a phone
+   cannot spread five of them: `MIN_CARD_WIDTH` stops the card shrinking past
+   170px, so the ring answers by pushing the outer pair off the edge instead —
+   37px past the viewport at 320px wide. Narrow tracks show three cards, which
+   fits with room to spare and keeps every card readable rather than shaving
+   them all down to slivers. */
+const VISIBLE_WIDE = 5;
+const VISIBLE_NARROW = 3;
+const NARROW_TRACK = 640; // track width below which the ring drops to three
 
 // The ring's reach is a fraction of the track's own measured width rather
 // than a fixed pixel count, via ResizeObserver below — so a phone-width
@@ -47,22 +54,36 @@ const RADIUS_Y_RATIO = 0.45; // a shallow arc, not a full circle
 // at sm/lg — a 2000px monitor and a 1300px laptop both get a card sized to
 // what their own ring actually has room for.
 const MIN_CARD_WIDTH = 170;
-// Capped rather than left to `radius.x * CARD_WIDTH_RATIO`: past roughly this
+// Capped rather than left to `radiusX * CARD_WIDTH_RATIO`: past roughly this
 // width the outermost pair starts running out of track to sit in, and the
 // active card overlaps its neighbours far enough to bury their titles.
 const MAX_CARD_WIDTH = 370;
 const CARD_WIDTH_RATIO = 0.95; // vs. radiusX
 const CARD_ASPECT = 0.66; // height / width
 const TRACK_PADDING = 40; // headroom above/below the arc so cards never clip
+const EDGE_MARGIN = 8; // gap kept between the outermost card and the track edge
 
-// The visible cards only ride the TOP of the ellipse: `ringPosition` puts the
-// active card at -radiusY and the outermost pair at -cos(72°)·radiusY, so the
-// arc's real vertical extent is far shorter than the full `radiusY * 2` of the
-// ellipse it's cut from. These two constants re-derive the outermost card's
-// angle and scale from the same numbers `ringPosition` uses, so the measured
-// extent can never drift from where the cards are actually drawn.
-const EDGE_ANGLE = (HALF / VISIBLE_COUNT) * Math.PI;
-const EDGE_SCALE = 1 - (HALF / (HALF + 1)) * 0.3;
+// `trackWidth` is 0 until the ResizeObserver's first callback. Falling back to
+// a desktop-ish width means the very first paint is a full ring rather than a
+// collapsed one that then springs open.
+const FALLBACK_TRACK_WIDTH = 960;
+
+/* Everything about the ring that follows from how many cards are on it.
+   `edgeAngle`/`edgeScale` describe the OUTERMOST visible card and are
+   re-derived from the same expressions `ringPosition` uses below, so the
+   measurements the layout depends on can never drift from where the cards
+   are actually drawn. */
+function ringSpec(visibleCount: number) {
+  const half = Math.floor(visibleCount / 2);
+  return {
+    visibleCount,
+    half,
+    edgeAngle: (half / visibleCount) * Math.PI,
+    edgeScale: 1 - (half / (half + 1)) * 0.3,
+  };
+}
+
+type RingSpec = ReturnType<typeof ringSpec>;
 
 interface RingGeometry {
   x: number;
@@ -78,22 +99,23 @@ function ringPosition(
   total: number,
   radiusX: number,
   radiusY: number,
+  spec: RingSpec,
 ): RingGeometry | null {
   if (total === 0) return null;
 
   let d = (((index - activeIndex) % total) + total) % total; // 0 … total-1
   if (d > total / 2) d -= total; // fold onto the short way round
-  if (Math.abs(d) > HALF) return null; // outside the visible span
+  if (Math.abs(d) > spec.half) return null; // outside the visible span
 
-  const angle = (d / VISIBLE_COUNT) * Math.PI;
+  const angle = (d / spec.visibleCount) * Math.PI;
   const x = Math.sin(angle) * radiusX;
   const y = -Math.cos(angle) * radiusY;
 
   const distance = Math.abs(d);
-  const maxDistance = HALF + 1;
+  const maxDistance = spec.half + 1;
   const scale = Math.max(0, 1 - (distance / maxDistance) * 0.3);
   const opacity = Math.max(0.3, 1 - (distance / maxDistance) * 0.7);
-  const zIndex = VISIBLE_COUNT - distance;
+  const zIndex = spec.visibleCount - distance;
 
   return { x, y, scale, opacity, zIndex };
 }
@@ -150,32 +172,51 @@ export function AgentCarousel({
   const [peekAgent, setPeekAgent] = useState<AgentResult | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
-  const [radius, setRadius] = useState({ x: 180, y: 81 });
+  // The one measured input. Card size, radius, card count and track height are
+  // all derived from it during render rather than kept as their own state, so
+  // there is a single source of truth and no chance of two of them disagreeing.
+  const [trackWidth, setTrackWidth] = useState(0);
   const reduceMotion = useReducedMotion() ?? false;
 
   useEffect(() => {
     const el = trackRef.current;
     if (!el) return;
     const observer = new ResizeObserver((entries) => {
-      const width = entries[0]?.contentRect.width ?? el.clientWidth;
-      const x = Math.min(
-        MAX_RADIUS_X,
-        Math.max(MIN_RADIUS_X, width * RADIUS_X_RATIO),
-      );
-      setRadius({ x, y: x * RADIUS_Y_RATIO });
+      setTrackWidth(entries[0]?.contentRect.width ?? el.clientWidth);
     });
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
+
+  const width = trackWidth || FALLBACK_TRACK_WIDTH;
+  const spec = ringSpec(width < NARROW_TRACK ? VISIBLE_NARROW : VISIBLE_WIDE);
+
+  const desiredRadiusX = Math.min(
+    MAX_RADIUS_X,
+    Math.max(MIN_RADIUS_X, width * RADIUS_X_RATIO),
+  );
 
   // Card size and the track's own height both fall out of the same radius
   // reading, so the arc and the cards riding it scale as one thing rather
   // than the ring changing size independently of what sits on it.
   const cardWidth = Math.min(
     MAX_CARD_WIDTH,
-    Math.max(MIN_CARD_WIDTH, radius.x * CARD_WIDTH_RATIO),
+    Math.max(MIN_CARD_WIDTH, desiredRadiusX * CARD_WIDTH_RATIO),
+    // …and never wider than the track itself, however narrow that gets.
+    Math.max(0, width - 2 * EDGE_MARGIN),
   );
   const cardHeight = cardWidth * CARD_ASPECT;
+
+  /* The largest radius that still keeps the outermost card inside the track.
+     This is the horizontal counterpart to the arc measurement below, and it is
+     what stops the ring overflowing on a phone: once `MIN_CARD_WIDTH` refuses
+     to shrink the card any further, the only remaining way to fit is to pull
+     the ring in, so that is what happens here. */
+  const fitRadiusX =
+    (width / 2 - EDGE_MARGIN - (cardWidth * spec.edgeScale) / 2) /
+    Math.sin(spec.edgeAngle);
+  const radiusX = Math.max(0, Math.min(desiredRadiusX, fitRadiusX));
+  const radiusY = radiusX * RADIUS_Y_RATIO;
 
   /* The arc's true top and bottom edges, measured from the track's centre.
      The top is the active card (angle 0, full scale); the bottom is the
@@ -183,9 +224,9 @@ export function AgentCarousel({
      scaled down as well. Sizing the track to `radiusY * 2` instead — as this
      did originally — left a dead band roughly 275px tall under the lowest
      card, which is what pushed the controls so far from the ring. */
-  const arcTop = -radius.y - cardHeight / 2;
+  const arcTop = -radiusY - cardHeight / 2;
   const arcBottom =
-    -Math.cos(EDGE_ANGLE) * radius.y + (cardHeight * EDGE_SCALE) / 2;
+    -Math.cos(spec.edgeAngle) * radiusY + (cardHeight * spec.edgeScale) / 2;
   const trackHeight = arcBottom - arcTop + TRACK_PADDING;
 
   /* CSS centres each card on the track (`top-1/2 -translate-y-1/2`), but the
@@ -260,14 +301,21 @@ export function AgentCarousel({
             else if (dragInfo.offset.x > 50) prev();
           }}
           // Height is computed, not a fixed/breakpoint class — it has to grow
-          // in lockstep with `radius.y` and `cardHeight` above, or the arc
+          // in lockstep with `radiusY` and `cardHeight` above, or the arc
           // widening on a big screen would just clip the top/bottom rows.
           style={{ height: trackHeight }}
           className="relative w-full cursor-grab touch-pan-y active:cursor-grabbing"
         >
           <AnimatePresence mode="popLayout">
             {ordered.map((result, index) => {
-              const pos = ringPosition(index, safeIndex, total, radius.x, radius.y);
+              const pos = ringPosition(
+                index,
+                safeIndex,
+                total,
+                radiusX,
+                radiusY,
+                spec,
+              );
               if (!pos) return null;
 
               const isActive = index === safeIndex;
