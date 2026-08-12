@@ -372,6 +372,92 @@ export interface ChatMessage {
   created_at: string;
 }
 
+// Mirrors backend/models.py `FilePatch` (PLAN-v5 Stage A).
+export interface FilePatch {
+  path: string;
+  action: "create" | "modify" | "delete";
+  original_sha: string | null;
+  original_content: string | null;
+  new_content: string | null;
+  diff: string;
+}
+
+// Mirrors backend/models.py `FixPlan` -- a deterministic, machine-actionable
+// fix. Unlike `FixSuggestion` (AI prose above), no model ever produces this;
+// plain Python decided every byte of every patch in it.
+export interface FixPlan {
+  finding_key: string;
+  fixer_slug: string;
+  tier: 1 | 2;
+  summary: string;
+  patches: FilePatch[];
+  created_at: string;
+}
+
+/**
+ * Preview a deterministic fix for one finding — computed live, never
+ * persisted. `null` means there's no deterministic fixer for this finding
+ * (only tier 1/2 findings ever have one); that's a normal answer, not an
+ * error, and the caller should fall back to `FixSuggestionPanel`'s AI advice.
+ */
+export async function fetchFixPlan(
+  scanId: string,
+  findingKey: string,
+): Promise<FixPlan | null> {
+  const res = await fetch(
+    `${API_BASE}/scans/${encodeURIComponent(scanId)}/findings/${encodeURIComponent(findingKey)}/fix/plan`,
+    withAuth(),
+  );
+  checkAuth(res);
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Fix plan unavailable (${res.status})`);
+  }
+  return res.json() as Promise<FixPlan | null>;
+}
+
+/**
+ * Plan and persist a deterministic fix for one finding, so it survives a
+ * page refresh and is included in `GET /scans/{id}/fix/bundle.zip`.
+ * Throws only on a genuine failure (not a repo scan, bad request) — an
+ * unfixable finding comes back as a normal `{ fixable: false, plan: null }`
+ * result, not a thrown error.
+ */
+export async function saveFixPlan(scanId: string, findingKey: string): Promise<FixPlan | null> {
+  const res = await fetch(`${API_BASE}/scans/${encodeURIComponent(scanId)}/fix/plan`, withAuth({
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ finding_keys: [findingKey] }),
+  }));
+  checkAuth(res);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Fix plan unavailable (${res.status})`);
+  }
+  const results = (await res.json()) as { finding_key: string; plan: FixPlan | null; fixable: boolean }[];
+  return results[0]?.plan ?? null;
+}
+
+/**
+ * Download every fix plan already saved for a scan (via `saveFixPlan`) as
+ * one zip of unified diffs. Throws if nothing has been planned yet.
+ */
+export async function downloadFixBundle(scanId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/scans/${encodeURIComponent(scanId)}/fix/bundle.zip`, withAuth());
+  checkAuth(res);
+  if (!res.ok) {
+    throw new Error(`No fix plans have been generated for this scan yet (${res.status})`);
+  }
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = `sentinels-fixes-${scanId.slice(0, 8)}.zip`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+}
+
 /**
  * Fetch (or generate) an AI fix suggestion for one finding.
  * `regenerate=true` bypasses the cache and forces a new LLM call.

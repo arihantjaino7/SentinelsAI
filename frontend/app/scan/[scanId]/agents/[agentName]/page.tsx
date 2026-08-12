@@ -204,7 +204,7 @@ export default function AgentPage() {
           </h2>
           <ul className="mt-7 max-w-3xl space-y-9">
             {problems.map((f) => (
-              <FindingRow key={f.id} finding={f} scanId={scanId} />
+              <FindingRow key={f.id} finding={f} scanId={scanId} isRepoScan={agentName.startsWith("repo-")} />
             ))}
           </ul>
         </section>

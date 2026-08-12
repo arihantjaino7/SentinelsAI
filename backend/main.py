@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
+from typing import Optional
 from urllib.parse import urlparse
 
 import secrets
@@ -53,8 +54,10 @@ from auth.session import (  # noqa: E402
     token_from_cookie,
 )
 from db import init_db  # noqa: E402
-from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixSuggestion, RepoFileEntry, ScanReport, ScanRequest, ScanSummary, User  # noqa: E402
+from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixPlan, FixSuggestion, RepoFileEntry, ScanReport, ScanRequest, ScanSummary, User  # noqa: E402
 from orchestrator import run_scan, run_scan_stream  # noqa: E402
+from remediation.patch import PlanValidationError  # noqa: E402
+from remediation.planning import NotARepoScan, build_bundle_zip, plan_and_save, preview_plan  # noqa: E402
 from repo_orchestrator import run_repo_scan, run_repo_scan_stream  # noqa: E402
 from report.pdf import generate_pdf  # noqa: E402
 from report.registry import get_exporter, list_formats  # noqa: E402
@@ -498,6 +501,86 @@ async def finding_fix(
     if suggestion is None:
         raise HTTPException(status_code=503, detail="Fix suggestion generation failed. Try again.")
     return suggestion
+
+
+@app.get("/scans/{scan_id}/findings/{finding_key}/fix/plan", response_model=Optional[FixPlan])
+async def finding_fix_plan(
+    scan_id: str, finding_key: str, user: User = Depends(current_user)
+) -> FixPlan | None:
+    """Preview a deterministic fix for one finding (PLAN-v5 Stage A) --
+    computed live against the repo's current GitHub state, never persisted.
+
+    `null` means there's no deterministic Fixer for this finding (only tier
+    1/2 findings ever have one) -- a normal answer, not an error; the
+    frontend falls back to the existing AI `FixSuggestionPanel`.
+    """
+    report = get_scan(scan_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"Scan {scan_id!r} not found")
+    try:
+        return await preview_plan(report, finding_key)
+    except NotARepoScan as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except PlanValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+class FixPlanRequest(BaseModel):
+    finding_keys: list[str]
+
+
+class FixPlanResult(BaseModel):
+    finding_key: str
+    plan: Optional[FixPlan] = None
+    fixable: bool = False
+
+
+@app.post("/scans/{scan_id}/fix/plan", response_model=list[FixPlanResult])
+async def scan_fix_plan(
+    scan_id: str, body: FixPlanRequest, user: User = Depends(current_user)
+) -> list[FixPlanResult]:
+    """Plan and persist a deterministic fix for each requested finding
+    (PLAN-v5 Stage A). Every key gets a result even when it isn't fixable
+    (`fixable=False`, `plan=null`) -- one unfixable finding in the batch is
+    never a reason to fail the whole request.
+    """
+    report = get_scan(scan_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"Scan {scan_id!r} not found")
+    if not body.finding_keys:
+        raise HTTPException(status_code=422, detail="finding_keys must not be empty")
+
+    try:
+        results = await plan_and_save(report, body.finding_keys)
+    except NotARepoScan as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return [
+        FixPlanResult(finding_key=key, plan=plan, fixable=plan is not None)
+        for key, plan in results.items()
+    ]
+
+
+@app.get("/scans/{scan_id}/fix/bundle.zip")
+def scan_fix_bundle(scan_id: str, user: User = Depends(current_user)) -> Response:
+    """Download every planned fix for a scan as one zip of unified diffs --
+    for applying fixes by hand instead of going through Stage B's PR flow
+    (not implemented yet). 404 if nothing has been planned via
+    `POST /scans/{id}/fix/plan` yet.
+    """
+    report = get_scan(scan_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"Scan {scan_id!r} not found")
+
+    bundle = build_bundle_zip(scan_id)
+    if bundle is None:
+        raise HTTPException(status_code=404, detail="No fix plans have been generated for this scan yet.")
+
+    return Response(
+        content=bundle,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="sentinels-fixes-{scan_id[:8]}.zip"'},
+    )
 
 
 class ChatQuestion(BaseModel):

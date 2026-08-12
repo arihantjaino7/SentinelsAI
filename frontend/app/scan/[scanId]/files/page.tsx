@@ -118,7 +118,7 @@ export default function FilesPage() {
               ) : (
                 <ul className="mt-6 max-w-3xl space-y-9">
                   {selectedFindings.map((f) => (
-                    <FindingRow key={f.id} finding={f} scanId={scanId} />
+                    <FindingRow key={f.id} finding={f} scanId={scanId} isRepoScan />
                   ))}
                 </ul>
               )}

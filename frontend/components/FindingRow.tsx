@@ -1,6 +1,7 @@
 "use client";
 
 import type { Finding } from "@/lib/api";
+import { FixPlanPanel } from "@/components/fixes/FixPlanPanel";
 import { FixSuggestionPanel } from "@/components/fixes/FixSuggestionPanel";
 
 /* One problem, as a line in an inspection record.
@@ -15,9 +16,16 @@ import { FixSuggestionPanel } from "@/components/fixes/FixSuggestionPanel";
 export function FindingRow({
   finding,
   scanId,
+  isRepoScan = false,
 }: {
   finding: Finding;
   scanId?: string;
+  // PLAN-v5 Stage A: FixPlanPanel only ever has something to offer on a repo
+  // scan (a URL scan has no file to patch) -- gated explicitly by the
+  // caller rather than guessed from `finding.file_path`, since the hygiene
+  // findings this stage's fixers most often apply to (`gitignore-present`,
+  // `repo-readme-present`) never set one.
+  isRepoScan?: boolean;
 }) {
   const isCritical = finding.severity === "Critical";
   // Only show the fix button when we have a scanId (legacy Report.tsx passes none).
@@ -101,6 +109,7 @@ export function FindingRow({
         </p>
       )}
 
+      {showFix && scanId && isRepoScan && <FixPlanPanel scanId={scanId} findingKey={finding.id} />}
       {showFix && scanId && <FixSuggestionPanel scanId={scanId} findingKey={finding.id} />}
     </li>
   );

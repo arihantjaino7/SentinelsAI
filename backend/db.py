@@ -209,6 +209,55 @@ ALTER TABLE scans ADD COLUMN user_id INTEGER;
 ALTER TABLE scans ADD COLUMN commit_sha TEXT;
 """
 
+# PLAN-v5 Stage A: the patch layer. `fix_plans` is what this stage actually
+# writes -- one row per (scan, finding) holding the deterministic FixPlan a
+# Fixer produced, replaced wholesale on every re-plan (see
+# storage/remediation.py's INSERT OR REPLACE). `fix_applications` and
+# `audit_log` land in this same migration but stay unwritten until Stage B
+# actually applies a plan -- the same precedent `_V7_SCHEMA` set for
+# `repo_files`: the table exists ahead of the milestone that first writes to
+# it, so that milestone isn't also a migration.
+_V11_SCHEMA = """
+CREATE TABLE fix_plans (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id     TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    finding_key TEXT NOT NULL,
+    fixer_slug  TEXT NOT NULL,
+    tier        INTEGER NOT NULL,
+    summary     TEXT NOT NULL,
+    plan_json   TEXT NOT NULL,               -- serialized FixPlan (patches + diffs)
+    created_at  TEXT NOT NULL,
+    UNIQUE(scan_id, finding_key)
+);
+CREATE INDEX idx_fix_plans_scan ON fix_plans(scan_id);
+
+CREATE TABLE fix_applications (
+    id          TEXT PRIMARY KEY,            -- uuid4
+    scan_id     TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    fix_plan_id INTEGER NOT NULL REFERENCES fix_plans(id) ON DELETE CASCADE,
+    finding_key TEXT NOT NULL,
+    fixer_slug  TEXT NOT NULL,
+    tier        INTEGER NOT NULL,
+    state       TEXT NOT NULL,                -- planned|pr_open|merged|verified|failed|abandoned
+    pr_url      TEXT,
+    branch      TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX idx_fix_applications_scan ON fix_applications(scan_id);
+
+CREATE TABLE audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER REFERENCES users(id),
+    scan_id     TEXT REFERENCES scans(id) ON DELETE SET NULL,
+    finding_key TEXT,
+    action      TEXT NOT NULL,               -- e.g. "plan_created", "pr_opened", "pr_merged"
+    detail      TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX idx_audit_log_scan ON audit_log(scan_id);
+"""
+
 # Each entry is (version, schema sql to apply to go from version-1 to version).
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _V1_SCHEMA),
@@ -221,6 +270,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (8, _V8_SCHEMA),
     (9, _V9_SCHEMA),
     (10, _V10_SCHEMA),
+    (11, _V11_SCHEMA),
 ]
 
 

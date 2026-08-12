@@ -28,6 +28,39 @@
 > stay open, sign-in → protected routes serve, logout revokes immediately.
 > `tsc --noEmit` clean. Note:
 > [`learning/58-sign-in-with-github-and-sessions.md`](learning/58-sign-in-with-github-and-sessions.md).
+>
+> Stage A done, 2026-08-12. New package `backend/remediation/`: `base.py` (`Fixer`
+> ABC), `source.py` (`FileSource` — current file content + blob SHA from GitHub's
+> Contents API, independent of `repo/fetch.py`'s tarball), `patch.py` (`build_diff`/
+> `make_patch`/`validate_plan` — the single safety gate), `tiers.py` (ID-prefix → tier
+> table), `budget.py` (`MAX_FILES_PER_PR` etc.), `registry.py` (`fixer_for`),
+> `planning.py` (orchestrates one plan/preview/bundle request). Four fixers: `workflows.py`
+> (pins `ci-unpinned-action-*` to a commit SHA — pure line-rewrite tested separately from
+> the network SHA resolver, per conflict #3), `gitignore.py` (`gitignore-present`,
+> creates only), `scaffolding.py` (`repo-readme-present` and `repo-env-example-present`,
+> both creates-only — the latter refuses to plan anything when no committed `.env`
+> exists to read variable names from, never inventing them), `dockerfile.py`
+> (`docker-root-user-*`, tier 2, base-image-aware `USER` insertion before the *last*
+> `CMD`/`ENTRYPOINT`, never trusting the finding's placeholder `line=1`). Migration
+> `(11, _V11_SCHEMA)` adds `fix_plans` (written by this stage), `fix_applications` and
+> `audit_log` (schema-ready, unwritten until Stage B — same precedent `repo_files`/V7 set).
+> New models in `backend/models.py`: `FilePatch`, `FixPlan`, `FixApplicationState`,
+> `FixApplication`. Three endpoints: `GET /scans/{id}/findings/{key}/fix/plan` (live
+> preview, never persisted), `POST /scans/{id}/fix/plan` (plans + saves a batch,
+> per-key `fixable` result), `GET /scans/{id}/fix/bundle.zip` (every saved plan's diffs,
+> zipped). Frontend: `FixPlanPanel.tsx` renders above the existing `FixSuggestionPanel`
+> on repo-scan findings, gated by a new `isRepoScan` prop on `FindingRow` (a URL scan
+> has no file to patch). Fixed in passing: `lib/agents.ts`'s `fetchAgentResult` was
+> missing `credentials: "include"`, a Stage-0 gap that silently 401ed the agent detail
+> page — where this panel lives — for every signed-in user; found and fixed during this
+> stage's own live verification. 233 tests green (96 new, `tests/test_remediation_*.py`
+> + `test_storage_remediation.py`), all offline/mocked except one manual live run against
+> a real public repo (`octocat/Hello-World`) that planned, saved, and bundled a real
+> `.gitignore` fix end to end, and one full browser pass (seeded session cookie, real
+> scan, click-through of preview → save → download bundle, confirmed via network log).
+> `tsc --noEmit` clean. Nothing in this stage writes to GitHub. Notes:
+> [`learning/59-deterministic-fixers-and-unified-diffs.md`](learning/59-deterministic-fixers-and-unified-diffs.md),
+> [`learning/60-the-diff-preview-ui.md`](learning/60-the-diff-preview-ui.md).
 
 ---
 

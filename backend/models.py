@@ -235,6 +235,76 @@ class User(BaseModel):
     avatar_url: Optional[str] = None
 
 
+class FilePatch(BaseModel):
+    """One file's exact change inside a FixPlan (PLAN-v5 Stage A).
+
+    Carries enough of the before/after content for a preview UI to render
+    without re-fetching anything, plus `original_sha` -- the blob SHA the
+    file had when this patch was built, which Stage B re-checks immediately
+    before writing anything ("Drift aborts", CLAUDE.md's remediation rule 7).
+    """
+
+    path: str                                # repo-relative, forward-slash
+    action: Literal["create", "modify", "delete"]
+    original_sha: Optional[str] = None       # the drift anchor; None for action="create"
+    original_content: Optional[str] = None   # None for action="create"
+    new_content: Optional[str] = None        # None for action="delete"
+    diff: str = ""                           # unified diff text, for the preview UI
+
+
+class FixPlan(BaseModel):
+    """A deterministic, machine-actionable fix for one Finding.
+
+    This is what Stage A produces: plain Python decided every byte of every
+    patch here. No model ever sees this shape before it's shown to a user
+    (CLAUDE.md's remediation rule 1: "The LLM never generates a security
+    patch"). `FixSuggestion` (above) is the AI's English explanation of a
+    finding; this is the different, later thing -- an actual diff.
+    """
+
+    finding_key: str                         # Finding.id this plan addresses
+    fixer_slug: str                          # which Fixer produced it
+    tier: int                                # 1 (certain) or 2 (review-required) -- remediation/tiers.py
+    summary: str                             # one-line "what this fix does"
+    patches: list[FilePatch] = Field(default_factory=list)
+    created_at: str                          # ISO 8601 UTC
+
+
+class FixApplicationState(str, Enum):
+    """Stage A only ever produces `PLANNED`. Every later value belongs to
+    Stage B (opening a PR) and Stage C (verifying it) -- named now because
+    the migration that adds `fix_applications` lands in this stage, ahead of
+    the code that transitions through most of these."""
+
+    PLANNED = "planned"
+    PR_OPEN = "pr_open"
+    MERGED = "merged"
+    VERIFIED = "verified"
+    FAILED = "failed"
+    ABANDONED = "abandoned"
+
+
+class FixApplication(BaseModel):
+    """One row of the remediation audit trail -- a FixPlan someone acted on.
+
+    Not written by anything in Stage A (there is nothing to act on yet, only
+    to plan) -- defined now because `fix_applications` is part of this
+    stage's migration, the same way `models.RepoFileEntry` was defined
+    ahead of the milestone that first populated `repo_files`.
+    """
+
+    id: str                                  # uuid4
+    scan_id: str
+    finding_key: str
+    fixer_slug: str
+    tier: int
+    state: FixApplicationState
+    pr_url: Optional[str] = None
+    branch: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
 class RepoFileEntry(BaseModel):
     """One row of the file-tree browser for a repo scan (R12).
 

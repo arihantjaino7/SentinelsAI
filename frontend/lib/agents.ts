@@ -40,8 +40,13 @@ export async function fetchAgentResult(
   scanId: string,
   agentName: string,
 ): Promise<AgentResult> {
+  // credentials: "include" -- PLAN-v5 Stage 0 made this route require a
+  // session cookie; this call was missed when that landed, so it always
+  // 401ed for a signed-in user. `/agents` and `/repo/agents` above stay
+  // plain fetches -- both are explicitly public routes (main.py).
   const res = await fetch(
     `${API_BASE}/scans/${encodeURIComponent(scanId)}/agents/${encodeURIComponent(agentName)}`,
+    { credentials: "include" },
   );
   if (!res.ok) throw new Error(`Agent result not found (${res.status})`);
   return res.json() as Promise<AgentResult>;
