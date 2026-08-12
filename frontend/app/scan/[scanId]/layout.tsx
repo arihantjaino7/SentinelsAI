@@ -50,7 +50,10 @@ export default function ScanLayout({ children }: { children: React.ReactNode }) 
   return (
     <div className="flex min-h-full flex-col">
       <nav className="border-b border-rule px-6 py-4">
-        <div className="mx-auto flex max-w-3xl items-center gap-5">
+        {/* `justify-between` so the crumbs stay left and Settings sits at the
+            right edge — it's a destination, not another step in this trail. */}
+        <div className="mx-auto flex max-w-3xl items-center justify-between gap-5">
+          <div className="flex items-center gap-5">
           <Link
             href="/"
             className="font-mono text-xs uppercase tracking-[0.35em] text-muted transition-colors hover:text-parchment"
@@ -79,6 +82,17 @@ export default function ScanLayout({ children }: { children: React.ReactNode }) 
               )}
             </>
           )}
+          </div>
+
+          {/* PLAN-v5 Stage B: connecting a repository is what makes the fix
+              flow on a finding row able to open a pull request, so the link to
+              it lives where those findings are read. */}
+          <Link
+            href="/settings"
+            className="font-mono text-xs uppercase tracking-[0.2em] text-muted transition-colors hover:text-parchment"
+          >
+            Settings
+          </Link>
         </div>
       </nav>
 

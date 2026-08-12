@@ -14,6 +14,7 @@
 
 import { useState } from "react";
 import { downloadFixBundle, fetchFixPlan, saveFixPlan, type FixPlan } from "@/lib/api";
+import { FixApplyPanel } from "@/components/fixes/FixApplyPanel";
 
 interface Props {
   scanId: string;
@@ -195,13 +196,18 @@ export function FixPlanPanel({ scanId, findingKey }: Props) {
         </button>
       </div>
 
-      {/* No GitHub write happens here (Stage B, not shipped yet) -- saving
-          only persists the plan so it survives a refresh and lands in the
-          bundle above. Said explicitly so "Save" never reads as "this just
-          opened a pull request". */}
+      {/* No GitHub write happens above this line -- "Save fix plan" only
+          persists the plan so it survives a refresh and lands in the bundle.
+          Said explicitly so "Save" never reads as "this just opened a pull
+          request"; the panel below is where a write can actually happen, and
+          it asks first. */}
       <p className="font-mono text-[8px] text-rule">
-        Preview only — opening a pull request isn't wired up yet. Download the patch and apply it by hand.
+        Saving stores the plan. Nothing reaches GitHub until you approve the pull request below.
       </p>
+
+      {/* PLAN-v5 Stages B + C. Mounted only once a plan exists, so a findings
+          list full of unfixable findings costs no requests. */}
+      <FixApplyPanel scanId={scanId} findingKey={findingKey} />
     </div>
   );
 }

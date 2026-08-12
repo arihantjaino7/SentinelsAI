@@ -75,8 +75,8 @@
 > as `fix_applications` rows in state `pr_open` with a frozen `plan` snapshot. Per
 > the definition of done below, this satisfies step 11 (PR explains the finding,
 > the change, and what it does *not* fix) through the PR itself; steps 12–16
-> (merge, re-verify, score delta, developer-run reporting) are Stage C and remain
-> open — **Stage C is deliberately not started yet.**
+> (merge, re-verify, score delta, developer-run reporting) are Stage C — built
+> in the block below, still to be run against a real merge.
 >
 > Two things fixed or noted during this live pass, neither of which touched the
 > ten Stage B rules or any test:
@@ -126,6 +126,98 @@
 > frontend yet — deliberately, per step 7. Notes:
 > [`learning/61-github-apps-and-installation-tokens.md`](learning/61-github-apps-and-installation-tokens.md),
 > [`learning/62-committing-without-a-clone.md`](learning/62-committing-without-a-clone.md).
+>
+> Stage C implemented 2026-08-12 (backend only, per its own spec — nothing in
+> this stage is wired to the frontend). New: `backend/remediation/verify.py`
+> (`verify_finding` — ownership → agent resolution → live PR-state refresh →
+> re-fetch → one agent → substitute → `calculate_score` twice → record) and
+> `remediation/states.py` (the transition table; `failed`/`abandoned` reachable
+> from anywhere, a state to itself legal so re-verifying is idempotent, nothing
+> leaves a finished state). Migration `(13, _V13_SCHEMA)` is a single
+> `ALTER TABLE fix_applications ADD COLUMN verification_json TEXT` — no
+> constraint changes, so none of migration 12's rebuild is needed. New model
+> `VerificationResult` (`before`/`after`/`delta`/`target_fixed`/`fixed[]`/
+> `still_failing[]`, plus the agent, ref, application id and whether it was
+> recorded); `FixApplication` gains `verification`. `storage/remediation.py`
+> gained `get_fix_application`, `save_verification` (state + evidence in one
+> statement), and transition enforcement inside `update_fix_application_state`.
+> Both registries gained the `{cls.name: cls}` lookup (`agent_for`,
+> `repo_agent_for`), derived from the existing lists. One route:
+> `POST /scans/{id}/findings/{key}/verify`.
+>
+> Three decisions worth recording, none of them a departure from this document:
+> - **A crashed agent refuses (502) instead of scoring.** `BaseRepoAgent.run`
+>   never raises, so a failed re-run returns *zero* findings — which would
+>   substitute in as "every problem here is fixed". "I couldn't check" and
+>   "it's fixed" must not collapse into the same answer.
+> - **`verified` means "we looked", not "it passed".** A merged fix that didn't
+>   work still becomes `verified`, with `target_fixed=false` carrying the
+>   result — otherwise it would sit in `merged` forever, indistinguishable from
+>   one nobody has checked.
+> - **A finding with no `fix_applications` row is still verifiable** (someone
+>   may have fixed it by hand): the result comes back `recorded=false` and the
+>   audit log gets a `fix_verified_unrecorded` row. An unmerged PR, by contrast,
+>   is refused with 409 — verifying it would re-observe the original problem and
+>   report the fixer as broken.
+>
+> The installation token is used for the re-fetch when the caller has one
+> (header set on the client `fetch_repo` already borrows, so `repo/fetch.py`
+> itself needed no change); without one the read is unauthenticated, which is
+> fine for a public repo since verification writes nothing to GitHub. 374 tests
+> green (53 new: `test_remediation_verify.py` (19), `test_remediation_states.py`
+> (11 cases), `test_agent_lookup.py`, `test_db_migrations.py` — migration 13 on
+> top of a real v12 DB with rows — plus 5 added to
+> `test_storage_fix_applications.py`), all offline: `fetch_repo` is replaced by
+> a fake async context manager yielding a temp directory, while the agent and
+> the scorer are the real ones. Plus a 16-check `TestClient` pass over the route
+> (401 unauthenticated, 404 unknown scan/finding, 409 on an open PR with the row
+> untouched, 200 + `recorded=false` with no application row, 200 +
+> `state=verified` + evidence attached after merge, verification visible on
+> `GET .../fix/applications`, original scan score unchanged, 403 for another
+> user). Steps 12–16 of the definition of done are now *implementable* but not
+> yet *run against a real merge* — that is the developer's pass (see below).
+> Note:
+> [`learning/63-verifying-a-fix-and-the-score-delta.md`](learning/63-verifying-a-fix-and-the-score-delta.md).
+>
+> UI wiring, 2026-08-12 — not a stage in this document (Stages B and C are both
+> backend by their own scope), but the work that makes them reachable, so it is
+> recorded here. New: `app/settings/page.tsx` (the page the install callback has
+> always redirected to and which did not exist — the "known gap" noted in the
+> Stage B block above, now closed: session identity, live/revoked installations,
+> connect, disconnect, and the `?installed=`/`?install_error=` banners) and
+> `components/fixes/FixApplyPanel.tsx` (dry run → open PR → merge on GitHub →
+> verify, mounted by `FixPlanPanel` only once a plan exists so nothing fetches on
+> page load). `lib/api.ts` gained the Stage B/C mirrors (`GitHubInstallation`,
+> `FixApplication`, `FixApplyPreview`, `FixApplyResult`, `VerificationResult`,
+> `FixApplicationState`), the calls (`fetchInstallations`, `revokeInstallation`,
+> `githubInstallUrl`, `applyFix` with `dryRun = true` as its default,
+> `fetchFixApplications`, `verifyFinding`), an `ApiError` that keeps the HTTP
+> status — 403 renders a link to `/settings`, 409 an informational line, anything
+> else an error — and `isApplyPreview`, the hand-written discriminator the
+> overlapping union needs (the frontend twin of the `response_model=None`
+> problem). Two small edits elsewhere: `FixPlanPanel`'s stale "opening a pull
+> request isn't wired up yet" footnote, and a Settings link in the scan nav.
+> Beyond the endpoints' own scope, one addition: the idle state offers
+> "Already fixed it yourself? Verify →", because the backend supports verifying a
+> finding with no application row and nothing exposed it.
+>
+> Live-verified in a browser against the real repository (seeded session cookie,
+> since sign-in is the developer's to do): `/settings` renders the real
+> `arihantjaino7` installation; the `gitignore-present` row shows the real
+> [PR #1](https://github.com/arihantjaino7/some-action-v1/pull/1) as
+> `pr_open` with its branch and link; Verify on it returned the real 409 ("has
+> not been merged yet") **without losing the pull request from the screen** — the
+> point of splitting the panel's state by question rather than by phase; a dry
+> run on `docker-root-user-Dockerfile` returned the real repo/branch/files/PR
+> body and wrote **no** `fix_applications` row and **no** audit row; and
+> "Verify by hand" on the same finding really re-ran `repo-config` against
+> `main`, reporting **64 → 64, no change, still failing** — correct, because
+> nothing has been merged. `tsc --noEmit` and ESLint clean (the three pre-existing
+> ESLint errors elsewhere in the app were left alone). **Not clicked:** "Open
+> pull request" — a second real PR on someone's repository is the developer's
+> call, not this pass's. Note:
+> [`learning/64-wiring-the-fix-flow-into-the-ui.md`](learning/64-wiring-the-fix-flow-into-the-ui.md).
+>
 
 ---
 
@@ -467,6 +559,17 @@ and a Dockerfile with no `USER` — the Stage B/C test target.
 
 Merge the PR when it appears, then run Verify. Steps 12–16 of the definition of done are
 the developer's; the report must say plainly which steps were run by whom.
+
+Stage C has no UI yet, so Verify is run against the endpoint directly — with the session
+cookie a browser sign-in already set:
+
+```
+POST http://localhost:8011/scans/{scan_id}/findings/{finding_key}/verify
+```
+
+For the Stage B PR that already exists, that is scan `959843b8-…` on
+`arihantjaino7/some-action-v1` and finding key `gitignore-present` (or
+`ci-unpinned-action-…`). A 409 means the pull request hasn't merged yet.
 
 ---
 

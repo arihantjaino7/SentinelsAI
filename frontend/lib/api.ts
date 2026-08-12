@@ -458,6 +458,200 @@ export async function downloadFixBundle(scanId: string): Promise<void> {
   setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 }
 
+/* ---------------------------------------------------------------------------
+   PLAN-v5 Stage B + C: opening the pull request, and checking it worked.
+
+   Everything above this line either reads data or writes to Sentinels' own
+   database. Everything below can write to somebody's GitHub repository, so the
+   error shape changes too: these functions throw an `ApiError` that keeps the
+   HTTP status, because the *reason* a write was refused decides what the UI
+   should offer next (403 "no repository access" → a link to /settings; 409
+   "not merged yet" → a nudge to merge, not a retry button).
+   --------------------------------------------------------------------------- */
+
+/** An error that remembers the status code the backend refused with. */
+export class ApiError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+/** Read `detail` off a FastAPI error body and throw it as an ApiError. */
+async function raiseApiError(res: Response, fallback: string): Promise<never> {
+  const body = await res.json().catch(() => ({}));
+  throw new ApiError((body as { detail?: string }).detail ?? fallback, res.status);
+}
+
+// Mirrors backend/models.py `GitHubInstallation` — one grant of repository
+// write access. Distinct from being signed in: signing in proves who you are,
+// an installation is permission to open pull requests on an account.
+export interface GitHubInstallation {
+  id: number;
+  installation_id: number;
+  account_login: string;
+  repo_selection: string;                 // "all" | "selected"
+  created_at: string;
+  revoked_at: string | null;              // null while live
+}
+
+// Mirrors `FixApplicationState`.
+export type FixApplicationState =
+  | "planned"
+  | "pr_open"
+  | "merged"
+  | "verified"
+  | "failed"
+  | "abandoned";
+
+// Mirrors `VerificationResult` (Stage C). Every number here came from re-running
+// one agent against the repo and calling the same deterministic scorer twice.
+export interface VerificationResult {
+  scan_id: string;
+  finding_key: string;
+  agent: string;
+  ref: string;
+  verified_at: string;
+  before: number;
+  after: number;
+  delta: number;
+  target_fixed: boolean;
+  fixed: string[];
+  still_failing: string[];
+  application_id: string | null;
+  recorded: boolean;
+}
+
+// Mirrors `FixApplication` — one row of the remediation audit trail.
+export interface FixApplication {
+  id: string;
+  scan_id: string;
+  finding_key: string;
+  fixer_slug: string;
+  tier: number;
+  state: FixApplicationState;
+  pr_url: string | null;
+  pr_number: number | null;
+  branch: string | null;
+  plan: FixPlan | null;
+  verification: VerificationResult | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// Mirrors `FixApplyPreview` — what a dry run returns. Nothing was written.
+export interface FixApplyPreview {
+  repo: string;                           // "owner/name"
+  base_branch: string;
+  branch: string;
+  commit_message: string;
+  pr_title: string;
+  pr_body: string;
+  finding_keys: string[];
+  patches: FilePatch[];
+}
+
+// Mirrors `FixApplyResult` — what a live apply produced.
+export interface FixApplyResult {
+  repo: string;
+  branch: string;
+  pr_url: string | null;
+  pr_number: number | null;
+  already_applied: boolean;
+  applications: FixApplication[];
+}
+
+/** Which of the two shapes `applyFix` came back with. The endpoint declares no
+ *  response model precisely because these overlap, so the discriminator is a
+ *  field only the preview has. */
+export function isApplyPreview(
+  value: FixApplyPreview | FixApplyResult,
+): value is FixApplyPreview {
+  return "pr_title" in value;
+}
+
+/** The URL to send the browser to for "connect a repository" — a full page
+ *  navigation, like sign-in, because it ends in a redirect to github.com. */
+export function githubInstallUrl(): string {
+  return `${API_BASE}/auth/github/install`;
+}
+
+/** The repository-write grants this user currently holds (live and revoked). */
+export async function fetchInstallations(): Promise<GitHubInstallation[]> {
+  const res = await fetch(`${API_BASE}/installations`, withAuth());
+  checkAuth(res);
+  if (!res.ok) await raiseApiError(res, `Couldn't load connected repositories (${res.status})`);
+  return res.json() as Promise<GitHubInstallation[]>;
+}
+
+/** Stop Sentinels using one installation. Only half a revocation — the App
+ *  stays installed on GitHub until the user removes it there. */
+export async function revokeInstallation(installationId: number): Promise<void> {
+  const res = await fetch(
+    `${API_BASE}/installations/${installationId}/revoke`,
+    withAuth({ method: "POST" }),
+  );
+  checkAuth(res);
+  if (!res.ok) await raiseApiError(res, `Couldn't disconnect (${res.status})`);
+}
+
+/**
+ * Turn saved fix plans into one branch, one commit, and one pull request.
+ *
+ * `dryRun` defaults to `true` here for the same reason it does on the backend:
+ * the shape that writes to somebody's repository has to be asked for
+ * explicitly. A dry run returns exactly what *would* be pushed.
+ */
+export async function applyFix(
+  scanId: string,
+  findingKeys: string[],
+  dryRun = true,
+): Promise<FixApplyPreview | FixApplyResult> {
+  const res = await fetch(`${API_BASE}/scans/${encodeURIComponent(scanId)}/fix/apply`, withAuth({
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ finding_keys: findingKeys, dry_run: dryRun }),
+  }));
+  checkAuth(res);
+  if (!res.ok) await raiseApiError(res, `Couldn't apply this fix (${res.status})`);
+  return res.json() as Promise<FixApplyPreview | FixApplyResult>;
+}
+
+/**
+ * Every fix application recorded for a scan. The backend re-reads any
+ * still-open pull request from GitHub as part of answering, so `state` means
+ * "GitHub says so", not "this is what we saw when we opened it".
+ */
+export async function fetchFixApplications(scanId: string): Promise<FixApplication[]> {
+  const res = await fetch(
+    `${API_BASE}/scans/${encodeURIComponent(scanId)}/fix/applications`,
+    withAuth(),
+  );
+  checkAuth(res);
+  if (!res.ok) await raiseApiError(res, `Couldn't load fix history (${res.status})`);
+  return res.json() as Promise<FixApplication[]>;
+}
+
+/**
+ * Re-run the agent responsible for one finding and get the real before/after
+ * score. Refuses with 409 while the pull request is still open — verifying
+ * then would only re-observe the original problem.
+ */
+export async function verifyFinding(
+  scanId: string,
+  findingKey: string,
+): Promise<VerificationResult> {
+  const res = await fetch(
+    `${API_BASE}/scans/${encodeURIComponent(scanId)}/findings/${encodeURIComponent(findingKey)}/verify`,
+    withAuth({ method: "POST" }),
+  );
+  checkAuth(res);
+  if (!res.ok) await raiseApiError(res, `Couldn't verify this fix (${res.status})`);
+  return res.json() as Promise<VerificationResult>;
+}
+
 /**
  * Fetch (or generate) an AI fix suggestion for one finding.
  * `regenerate=true` bypasses the cache and forces a new LLM call.
