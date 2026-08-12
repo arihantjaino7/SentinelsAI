@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -27,7 +28,15 @@ from pydantic import BaseModel
 # present) once, at startup — so ai/analyst.py's os.environ.get() call later,
 # at request time, sees it without every module that wants an env var
 # needing to load .env itself.
-load_dotenv()
+#
+# Explicit path, not bare load_dotenv(): with no argument, python-dotenv
+# searches the *current working directory* and upward for a .env — and the
+# working directory uvicorn is launched from (e.g. the repo root, per
+# .claude/launch.json) is not necessarily this file's own directory. Search
+# never goes *into* a subdirectory, so a bare call silently finds nothing and
+# every env-gated feature (sign-in, autofix) fails with "not configured"
+# despite backend/.env being filled in correctly.
+load_dotenv(Path(__file__).parent / ".env")
 
 from agents.registry import list_agents  # noqa: E402
 from agents.repo_registry import list_repo_agents  # noqa: E402

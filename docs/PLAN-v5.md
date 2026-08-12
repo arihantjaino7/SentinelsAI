@@ -62,9 +62,39 @@
 > [`learning/59-deterministic-fixers-and-unified-diffs.md`](learning/59-deterministic-fixers-and-unified-diffs.md),
 > [`learning/60-the-diff-preview-ui.md`](learning/60-the-diff-preview-ui.md).
 >
-> Stage B implemented 2026-08-12 — **backend only; not yet run against a real
-> repository**, so per the definition of done below this is not "the flow works"
-> until a real PR URL exists (steps 12–16 remain the developer's). Migration
+> Stage B implemented 2026-08-12, **live-verified the same day** — real GitHub App
+> (`sentinels-autofix-4309`), real installation on a throwaway public repo
+> ([`arihantjaino7/some-action-v1`](https://github.com/arihantjaino7/some-action-v1):
+> a third-party-Action workflow, no `.gitignore`, a `Dockerfile` with no `USER`),
+> real scan (`ci-unpinned-action-*` and `docker-root-user-Dockerfile` both fired
+> correctly), real dry run, then a real apply:
+> [PR #1](https://github.com/arihantjaino7/some-action-v1/pull/1), branch
+> `sentinels/fix-959843b8-1786538197` → `main`, exactly the two planned files
+> changed (`.gitignore` created, `.github/workflows/ci.yml`'s `hashicorp/setup-
+> terraform@v2` resolved to a real commit SHA and pinned), both findings recorded
+> as `fix_applications` rows in state `pr_open` with a frozen `plan` snapshot. Per
+> the definition of done below, this satisfies step 11 (PR explains the finding,
+> the change, and what it does *not* fix) through the PR itself; steps 12–16
+> (merge, re-verify, score delta, developer-run reporting) are Stage C and remain
+> open — **Stage C is deliberately not started yet.**
+>
+> Two things fixed or noted during this live pass, neither of which touched the
+> ten Stage B rules or any test:
+> - **Real bug, fixed:** `main.py`'s `load_dotenv()` searched upward from the
+>   process's *working directory*, which `.claude/launch.json` sets to the repo
+>   root, not `backend/` — so `backend/.env` was silently never found when run via
+>   the normal launch config (every env-gated feature failed with "not
+>   configured" despite a correctly filled-in `.env`). Now loads
+>   `Path(__file__).parent / ".env"` explicitly. Pre-existing since Stage 0, not
+>   introduced by Stage B; just first surfaced by it.
+> - **Known gap, not fixed:** the install callback redirects to
+>   `{frontend}/settings?installed=...`, and no `/settings` page exists in the
+>   Next.js app yet — a real 404 in the browser, harmless (the backend write
+>   still completes and was confirmed via direct DB read), but confusing during
+>   manual testing. Building that page is frontend work for whenever Stage B gets
+>   wired to the UI, not part of this stage's scope.
+>
+> Migration
 > `(12, _V12_SCHEMA)` rebuilds `fix_applications` (SQLite cannot ALTER a FK in
 > place): adds `plan_json` + `pr_number`, makes `fix_plan_id` nullable /
 > `ON DELETE SET NULL`, and adds the partial unique index on
