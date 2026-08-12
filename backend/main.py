@@ -66,11 +66,12 @@ from auth.session import (  # noqa: E402
     token_from_cookie,
 )
 from db import init_db  # noqa: E402
-from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixApplication, FixApplyPreview, FixPlan, FixSuggestion, GitHubInstallation, RepoFileEntry, ScanReport, ScanRequest, ScanSummary, User, VerificationResult  # noqa: E402
+from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixApplication, FixApplyPreview, FixPlan, FixSuggestion, FixSummary, GitHubInstallation, RepoFileEntry, ScanReport, ScanRequest, ScanSummary, User, VerificationResult  # noqa: E402
 from orchestrator import run_scan, run_scan_stream  # noqa: E402
 from remediation.apply import ApplyError, apply_fixes, refresh_applications  # noqa: E402
 from remediation.patch import PlanValidationError  # noqa: E402
 from remediation.planning import NotARepoScan, build_bundle_zip, plan_and_save, preview_plan  # noqa: E402
+from remediation.registry import fixable_findings  # noqa: E402
 from remediation.tokens import fetch_installation  # noqa: E402
 from remediation.verify import VerifyError, verify_finding  # noqa: E402
 from repo_orchestrator import run_repo_scan, run_repo_scan_stream  # noqa: E402
@@ -617,6 +618,31 @@ async def finding_fix(
     if suggestion is None:
         raise HTTPException(status_code=503, detail="Fix suggestion generation failed. Try again.")
     return suggestion
+
+
+@app.get("/scans/{scan_id}/fix/summary", response_model=FixSummary)
+def scan_fix_summary(scan_id: str, user: User = Depends(current_user)) -> FixSummary:
+    """How many of this scan's current findings have a deterministic Fixer --
+    what the scan overview page's "N fixes available" badge reads.
+
+    Deliberately cheap: `fixable_findings` only calls each Fixer's
+    `handles()`, a pure string check with no network involved, so this never
+    re-reads the repository the way previewing an actual plan does. That
+    also means it can say "might be fixable" but not "is fixable right
+    now" -- a Fixer can still find nothing left to do once it reads the
+    repo's current state, which is what `GET .../fix/plan` is for.
+    """
+    report = get_scan(scan_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"Scan {scan_id!r} not found")
+
+    candidates = fixable_findings(report.findings)
+    first = candidates[0] if candidates else None
+    return FixSummary(
+        fixable_count=len(candidates),
+        first_finding_key=first.id if first else None,
+        first_agent=first.agent if first else None,
+    )
 
 
 @app.get("/scans/{scan_id}/findings/{finding_key}/fix/plan", response_model=Optional[FixPlan])

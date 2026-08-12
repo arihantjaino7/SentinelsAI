@@ -218,6 +218,30 @@
 > call, not this pass's. Note:
 > [`learning/64-wiring-the-fix-flow-into-the-ui.md`](learning/64-wiring-the-fix-flow-into-the-ui.md).
 >
+> Overview-page fix count, 2026-08-12 — also not a stage, a small piece of
+> discoverability: the scan overview page (the one landed on right after a
+> scan) showed severity counts and a "main issue" callout with no sign a fix
+> flow existed at all. New: `remediation/registry.py`'s `fixable_findings`
+> (pure — calls only each Fixer's `handles()`, never `plan()`, so it is cheap
+> enough to call on every overview page load; "might be fixable," the same
+> honest hedge `FixPlanPanel`'s own check button already carries, since a
+> Fixer can still find nothing left to do once it actually reads the repo),
+> `models.FixSummary`, `GET /scans/{id}/fix/summary` (same "computed fresh per
+> call, not carried on the immutable `ScanReport`" shape as
+> `GET /scans/{id}/checklist`/`.../files`), and an `Autofix` badge alongside
+> `MainIssue`/`DeploymentBadge` that links straight to the first fixable
+> finding's agent page. Deliberately not a hardcoded id table on the frontend
+> side — the backend's `FIXERS` list is the one place that table exists, so a
+> sixth Fixer is picked up automatically rather than needing a second,
+> forgettable edit. 378 tests green (4 new, `test_remediation_registry.py`);
+> live-verified: the real repo scan returns `fixable_count: 5` (three from
+> `repo-config`, two from `repo-hygiene`) and the badge links to `repo-hygiene`,
+> not the agent the main-issue callout points at; a URL scan shows no badge and
+> makes no `fix/summary` request at all (checked via the network log).
+> `tsc --noEmit` and ESLint clean (the one pre-existing error on this page,
+> unrelated to this change, left alone). Note:
+> [`learning/65-a-badge-that-costs-one-cheap-request.md`](learning/65-a-badge-that-costs-one-cheap-request.md).
+>
 
 ---
 

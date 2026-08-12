@@ -12,8 +12,10 @@ import { useParams } from "next/navigation";
 import Link from "next/link";
 import {
   downloadReportPdf,
+  fetchFixSummary,
   fetchScan,
   type Finding,
+  type FixSummary,
   type ScanReport,
 } from "@/lib/api";
 import { fetchAgents, fetchRepoAgents } from "@/lib/agents";
@@ -100,10 +102,50 @@ function DeploymentBadge({
   );
 }
 
+/* PLAN-v5 Stages A-C's own badge — "N fixes available" links straight to the
+   first one, the same one-click-away pattern DeploymentBadge uses for the
+   checklist. Rendered only when there's at least one (see the caller): a
+   badge reading "0 fixes available" would say nothing a clean scan doesn't
+   already say better by having no badge there at all. */
+function FixCountBadge({
+  summary,
+  scanId,
+}: {
+  summary: FixSummary;
+  scanId: string;
+}) {
+  const href =
+    summary.first_agent && summary.first_finding_key
+      ? `/scan/${scanId}/agents/${summary.first_agent}`
+      : `/scan/${scanId}/files`;
+
+  return (
+    <Link
+      href={href}
+      className="glass flex items-center gap-4 px-7 py-5 transition-colors hover:bg-white/8"
+    >
+      <div>
+        <p className="font-mono text-xs uppercase tracking-[0.2em] text-muted">
+          Autofix
+        </p>
+        <p className="mt-1.5 font-display text-4xl leading-none">
+          {summary.fixable_count}
+        </p>
+      </div>
+      <p className="max-w-[9rem] text-sm leading-snug text-muted">
+        {summary.fixable_count === 1
+          ? "fix available →"
+          : "fixes available →"}
+      </p>
+    </Link>
+  );
+}
+
 export default function ScanPage() {
   const { scanId } = useParams<{ scanId: string }>();
   const [report, setReport] = useState<ScanReport | null>(null);
   const [agentInfo, setAgentInfo] = useState<AgentInfo[]>([]);
+  const [fixSummary, setFixSummary] = useState<FixSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -120,6 +162,12 @@ export default function ScanPage() {
         setAgentInfo(
           await (scan.target_type === "repo" ? fetchRepoAgents() : fetchAgents()),
         );
+        // Only a repo scan can have a deterministic Fixer at all (PLAN-v5) —
+        // skip the request for a URL scan rather than asking a question with
+        // a guaranteed answer of zero.
+        if (scan.target_type === "repo") {
+          setFixSummary(await fetchFixSummary(scanId));
+        }
       })
       .catch(() => setNotFound(true))
       .finally(() => setLoading(false));
@@ -253,7 +301,10 @@ export default function ScanPage() {
         </div>
       </header>
 
-      {(mainIssue || report.deployment_status !== null || report.readiness_score !== null) && (
+      {(mainIssue ||
+        report.deployment_status !== null ||
+        report.readiness_score !== null ||
+        (fixSummary && fixSummary.fixable_count > 0)) && (
         <div className="mt-12 flex flex-wrap gap-5">
           {mainIssue && <MainIssue finding={mainIssue} scanId={scanId} />}
           <DeploymentBadge
@@ -261,6 +312,9 @@ export default function ScanPage() {
             readinessScore={report.readiness_score}
             scanId={scanId}
           />
+          {fixSummary && fixSummary.fixable_count > 0 && (
+            <FixCountBadge summary={fixSummary} scanId={scanId} />
+          )}
         </div>
       )}
 

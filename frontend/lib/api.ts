@@ -394,6 +394,32 @@ export interface FixPlan {
   created_at: string;
 }
 
+// Mirrors backend/models.py `FixSummary` -- how many of a scan's current
+// findings have a deterministic Fixer, and where to send a click about it.
+export interface FixSummary {
+  fixable_count: number;
+  first_finding_key: string | null;   // null only when fixable_count is 0
+  first_agent: string | null;
+}
+
+/**
+ * How many of a scan's findings have a deterministic Fixer -- cheap enough
+ * to call from the scan overview page. Returns a zero summary on failure
+ * rather than throwing: a badge that can't load is worth hiding, not worth
+ * breaking the page it sits on.
+ */
+export async function fetchFixSummary(scanId: string): Promise<FixSummary> {
+  const zero: FixSummary = { fixable_count: 0, first_finding_key: null, first_agent: null };
+  try {
+    const res = await fetch(`${API_BASE}/scans/${encodeURIComponent(scanId)}/fix/summary`, withAuth());
+    checkAuth(res);
+    if (!res.ok) return zero;
+    return res.json() as Promise<FixSummary>;
+  } catch {
+    return zero;
+  }
+}
+
 /**
  * Preview a deterministic fix for one finding — computed live, never
  * persisted. `null` means there's no deterministic fixer for this finding

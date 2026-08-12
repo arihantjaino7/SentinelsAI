@@ -270,6 +270,22 @@ class FixPlan(BaseModel):
     created_at: str                          # ISO 8601 UTC
 
 
+class FixSummary(BaseModel):
+    """How many of a scan's current findings have a deterministic Fixer --
+    the number the scan overview page's badge shows, without making anyone
+    open an agent page first to find out.
+
+    Deliberately just a count plus one place to send the click: computing
+    "which fixer" for every finding and rendering a menu of them is a bigger
+    piece of UI than a summary badge needs, and every fixable finding is
+    already reachable from its own agent page.
+    """
+
+    fixable_count: int
+    first_finding_key: Optional[str] = None  # None only when fixable_count == 0
+    first_agent: Optional[str] = None        # which agent page to link to
+
+
 class FixApplicationState(str, Enum):
     """Stage A only ever produces `PLANNED`. Every later value belongs to
     Stage B (opening a PR) and Stage C (verifying it) -- named now because
