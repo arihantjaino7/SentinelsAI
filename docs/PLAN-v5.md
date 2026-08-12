@@ -123,6 +123,20 @@ Recorded here because each one changed the design:
 7. **`gitignore-present` lives in `config.py`**, not `hygiene.py`, and carries no `file_path`.
 8. **`scans` stores no commit SHA**, so a re-plan can silently target a different commit
    than the scan saw. Fixed by a column in migration 10.
+9. **`fix_plans` is `INSERT OR REPLACE`d on every re-plan** (`storage/remediation.py`),
+   so a re-plan gives the row a *new* autoincrement id. `fix_applications.fix_plan_id`
+   was `NOT NULL REFERENCES fix_plans(id) ON DELETE CASCADE` — a re-plan of an already-
+   applied finding would have cascade-deleted its `fix_applications` row, silently
+   destroying audit history for a PR that might still be open or already merged. Fixed
+   in migration 12: `fix_applications` gets its own frozen `plan_json` snapshot and the
+   FK becomes nullable/`ON DELETE SET NULL` — an audit row must never depend on a plan
+   row surviving.
+10. **No GitHub App *installation* flow exists.** `github_installations` (migration 10)
+    has zero reads or writes anywhere — Stage 0 only built the *sign-in* half
+    (`auth/github_oauth.py`: read identity once, discard the token). Stage B cannot
+    mint an installation token without first knowing which installation belongs to
+    which user's which repo, so a small install-linking flow (§Stage B) has to exist
+    before `tokens.py` has anything to mint against.
 
 ---
 
@@ -209,29 +223,126 @@ tests. Nothing in this stage touches GitHub.
 
 ## Stage B — GitHub writes
 
-**Added:** `remediation/github.py` (Git Data API: ref → blob → tree → commit → ref → PR,
-no local clone), `remediation/tokens.py` (`TokenProvider` interface; `AppTokenProvider`
-mints 1-hour installation tokens from a JWT signed with the App private key;
-`DevTokenProvider` reads `SENTINELS_GITHUB_DEV_TOKEN` and **refuses to run unless
-`SENTINELS_ALLOW_DEV_TOKEN=1`**), `remediation/pr_body.py`.
+Designed 2026-08-12 (audited against the actual Stage A code, not just this document —
+see conflicts #9–10); **required invariants below are non-negotiable for this stage**,
+not optional hardening, per explicit sign-off:
 
-**Dry-run first.** `apply(plan, dry_run=True)` returns repo, branch name, files, diff,
-commit message, PR title and body, and writes nothing. The live path is not wired to the
-frontend until dry run is boring against a throwaway repo.
+> 1. `fix_applications.plan_json` is an immutable snapshot of the exact `FixPlan` applied
+>    — the audit record, independent of `fix_plans` ever changing or disappearing.
+> 2. `fix_applications.fix_plan_id` is nullable, `ON DELETE SET NULL` — a live-plan
+>    reference when convenient, never something an audit row's survival depends on.
+> 3. **Strict ownership, no exception:** `POST /scans/{id}/fix/apply` requires
+>    `scan.user_id == authenticated_user.id`. Unlike `DELETE /scans/{id}` (which treats a
+>    legacy unowned scan as fair game for any signed-in user), an unowned scan can
+>    **never** be applied — there is no one whose installation it would even use.
+> 4. **Installation ownership is checked independently of scan ownership** — an active
+>    (`revoked_at IS NULL`) `github_installations` row belonging to `authenticated_user.id`
+>    whose `account_login` matches the target repo's owner. Both checks must pass; neither
+>    substitutes for the other.
 
-**`POST /scans/{id}/fix/apply`** — verify installation ownership → re-check every
-`original_sha` and **abort on drift** → create `sentinels/fix-{scan_short}-{n}` → one
-commit → one PR carrying all selected fixes → write `fix_applications` + `audit_log`.
-`GET /scans/{id}/fix/applications` polls PR state.
+### Two things this stage has to build that PLAN-v5 previously assumed already existed
+
+**Installation linking** (conflict #10) — a flow distinct from sign-in, since a user can
+sign in without ever granting repo-write access:
+
+- `GET /auth/github/install` — mints a signed `state`, redirects to
+  `https://github.com/apps/<app-slug>/installations/new`.
+- `GET /auth/github/install/callback?installation_id&setup_action&state` — verifies
+  `state` against the session (CSRF, same pattern as `auth/github_oauth.py`'s login
+  flow), then persists a `github_installations` row. No OAuth token round-trip needed to
+  "verify" the installation belongs to this user: GitHub only ever redirects here after
+  the signed-in-on-github.com user themselves completed the install/authorize screen for
+  that installation, and the `state` match ties that redirect to *this* Sentinels session.
+- `GET /installations` — the caller's linked installations (for a "connect a repo" UI).
+- `POST /installations/{id}/revoke` — soft-revoke on our side (`revoked_at`); the real
+  revocation still happens on GitHub's side, independently, whenever the user chooses.
+
+**`backend/storage/installations.py`** (new) — CRUD for `github_installations`: save on
+callback, look up by `(user_id, account_login)`, mark revoked. Nothing here yet.
+
+### Added
+
+`remediation/tokens.py` — `TokenProvider` ABC; `AppTokenProvider` mints ~1h installation
+tokens from a JWT (RS256, `iss=app_id`, ~9min exp) signed with the App's private key,
+via `POST /app/installations/{id}/access_tokens`; `DevTokenProvider` reads
+`SENTINELS_GITHUB_DEV_TOKEN` and **refuses to run unless `SENTINELS_ALLOW_DEV_TOKEN=1`**.
+First new dependencies since Stage 0: `PyJWT`, `cryptography`.
+
+`remediation/github.py` — Git Data API, no local clone: base ref (reuses Stage A's
+`source.resolve_ref_sha` — the commits endpoint already accepts a branch name) → one
+`git/blobs` call per changed file → one `git/trees` call (base tree + new blobs) → one
+`git/commits` call (one parent) → one `git/refs` call (create the branch pointing at that
+commit) → one `pulls` call. One commit, one PR, however many files.
+
+`remediation/pr_body.py` — deterministic title/body template. Always states, per finding:
+what was fixed, and **what it does not fix** (secret removal never rotates or erases
+history — CLAUDE.md rule 9) — assembled from data already on the `Finding`/`FixPlan`,
+never from a model.
+
+`remediation/apply.py` — the one place that calls `github.py`, mirroring `planning.py`'s
+role for the plan endpoints. Order of operations for `apply(scan, finding_keys, dry_run)`:
+
+1. Ownership check (invariant #3) → installation lookup (invariant #4).
+2. Idempotency check — an existing **non-terminal** `fix_applications` row per requested
+   `finding_key`. All-already-applied → return the existing PR, not a new one.
+   Mixed (some applied, some new) → reject the batch rather than silently splitting it.
+3. Re-run `validate_plan()` per finding — never trust a stored plan just because it
+   passed once.
+4. Cross-plan batch check (new, beyond Stage A's single-plan `validate_plan`): total
+   files across the *whole* selection ≤ `MAX_FILES_PER_PR`; no two plans touch the same
+   path.
+5. Drift re-check — re-fetch every unique path's blob SHA via `source.get_file`, compare
+   to `original_sha`. **Any** mismatch aborts the **entire batch**, before any write.
+6. `MAX_PRS_PER_SCAN` / `MAX_PRS_PER_HOUR` budget check (constants exist since Stage A,
+   unenforced until now).
+7. `dry_run=True` stops here — returns repo, branch name, files, diffs, commit message,
+   PR title/body. Nothing written. The live path is not wired to the frontend until dry
+   run is boring against a throwaway repo.
+8. Branch name validated against `^sentinels/fix-[0-9a-f]{8}-\d+$` and checked against
+   the repo's `default_branch` before the first write call — defense in depth even
+   though the prefix should make collision structurally impossible.
+9. Mint token → the Git Data API sequence above → one PR.
+10. Write one `fix_applications` row per finding (`state="pr_open"`, `plan_json` snapshot)
+    + `audit_log` rows. On PR-creation failure after the branch ref was already created:
+    best-effort `DELETE .../git/refs/heads/{branch}` so a failed apply never leaves an
+    orphan branch sitting in the user's repo.
+
+**`POST /scans/{id}/fix/apply`** — body `{finding_keys: list[str], dry_run: bool}`.
+**`GET /scans/{id}/fix/applications`** — lists a scan's `fix_applications`; any row still
+`pr_open` gets a live `GET .../pulls/{number}` on read, updating state to `merged`/closed
+as GitHub reports it — Stage C trusts this field, so it has to be accurate, not just
+"we haven't checked."
 
 The installation token is also passed to `repo/fetch.py`, lifting GitHub's ceiling from 60
 to 5000 requests/hour — verification re-downloads the tarball each run and would otherwise
 hit the unauthenticated wall mid-demo.
 
-**Verification:** GitHub failure injection (401, 403, 404, branch-already-exists,
-PR-creation failure, commit failure), drift-abort, branch-prefix enforcement. Then a real
-PR against a throwaway repo — **the flow is not reported as working until that PR URL
-exists**.
+### DB — migration `(12, _V12_SCHEMA)`
+
+```sql
+ALTER TABLE fix_applications ADD COLUMN plan_json TEXT;   -- backfilled NOT NULL going forward
+-- fix_plan_id's FK behavior changes from ON DELETE CASCADE to ON DELETE SET NULL
+-- (SQLite can't ALTER a FK in place -- rebuilt via the standard
+-- create-new-table/copy/drop/rename sequence, same as any SQLite FK change)
+CREATE UNIQUE INDEX idx_fix_applications_active
+    ON fix_applications(scan_id, finding_key)
+    WHERE state NOT IN ('failed', 'abandoned');
+```
+
+The partial unique index is the DB-level backstop for the idempotency check in `apply.py`
+step 2 — belt and suspenders, not a replacement for the application-level check (which
+gives a much better error message).
+
+### Verification
+
+GitHub failure injection (401, 403, 404, branch-already-exists, PR-creation failure,
+commit failure — all against a mocked transport, same as Stage A's tests) for every step
+of `github.py` and `tokens.py`; `apply.py` tests for both required invariants (ownership
+rejection, installation-ownership rejection), idempotency (repeat call, mixed-selection
+rejection), drift-abort (whole batch), budget rejection, orphan-branch cleanup on
+PR-creation failure. Migration 12 applies cleanly on top of an existing v11 DB and the
+partial index actually rejects a duplicate active row. Then a real PR against a
+throwaway repo — **the flow is not reported as working until that PR URL exists**.
 **Notes:** `61-github-apps-and-installation-tokens.md`, `62-committing-without-a-clone.md`.
 
 ---
