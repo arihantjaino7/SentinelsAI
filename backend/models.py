@@ -287,10 +287,11 @@ class FixApplicationState(str, Enum):
 class FixApplication(BaseModel):
     """One row of the remediation audit trail -- a FixPlan someone acted on.
 
-    Not written by anything in Stage A (there is nothing to act on yet, only
-    to plan) -- defined now because `fix_applications` is part of this
-    stage's migration, the same way `models.RepoFileEntry` was defined
-    ahead of the milestone that first populated `repo_files`.
+    `plan` is a *frozen copy* of the FixPlan that was actually applied, not a
+    pointer to one. `fix_plans` is replaced wholesale on every re-plan, so a
+    reference would eventually describe a different patch than the one in the
+    pull request -- or vanish entirely (PLAN-v5.md conflict #9). An audit
+    record has to survive its subject changing.
     """
 
     id: str                                  # uuid4
@@ -300,9 +301,65 @@ class FixApplication(BaseModel):
     tier: int
     state: FixApplicationState
     pr_url: Optional[str] = None
+    pr_number: Optional[int] = None
     branch: Optional[str] = None
+    plan: Optional[FixPlan] = None           # the immutable snapshot
     created_at: str
     updated_at: str
+
+
+class GitHubInstallation(BaseModel):
+    """One repository-write grant: this user installed the Sentinels GitHub
+    App on this GitHub account (PLAN-v5 Stage B).
+
+    Distinct from signing in. Signing in says "GitHub confirms who you are";
+    an installation says "you have given Sentinels permission to write to
+    repositories under this account". A user can do the first without ever
+    doing the second, which is why these are two separate flows.
+    """
+
+    id: int                                  # our own row id
+    installation_id: int                     # GitHub's id for the installation
+    account_login: str                       # the org/user the App is installed on
+    repo_selection: str                      # "all" | "selected"
+    created_at: str
+    revoked_at: Optional[str] = None         # None while live
+
+
+class FixApplyPreview(BaseModel):
+    """What `POST /scans/{id}/fix/apply` with `dry_run=true` returns: exactly
+    what *would* be pushed, with nothing written anywhere.
+
+    The whole point of Stage B's step 7 -- every check has already run by the
+    time this is built, so a preview that comes back clean means the live
+    call would have succeeded too.
+    """
+
+    repo: str                                # "owner/name"
+    base_branch: str
+    branch: str
+    commit_message: str
+    pr_title: str
+    pr_body: str
+    finding_keys: list[str] = Field(default_factory=list)
+    patches: list[FilePatch] = Field(default_factory=list)
+
+
+class FixApplyResult(BaseModel):
+    """What a live apply produced: one branch, one pull request, and one audit
+    row per finding it covers.
+
+    `already_applied` distinguishes "Sentinels just opened this" from "this
+    finding already had an open pull request, here it is again" — the second
+    is a successful, deliberately unrepeated write, not a new one.
+    """
+
+    repo: str                                # "owner/name"
+    branch: str
+    pr_url: Optional[str] = None
+    pr_number: Optional[int] = None
+    already_applied: bool = False
+    applications: list[FixApplication] = Field(default_factory=list)
 
 
 class RepoFileEntry(BaseModel):

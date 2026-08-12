@@ -76,6 +76,31 @@ def missing_settings() -> list[str]:
     return missing
 
 
+def get_app_slug() -> str | None:
+    """The App's URL name — the `<slug>` in github.com/apps/<slug>.
+
+    Not the same string as the App's display name and not derivable from it
+    (GitHub lowercases and hyphenates, but also disambiguates collisions), so
+    it is configured rather than guessed.
+    """
+    return os.environ.get("GITHUB_APP_SLUG") or None
+
+
+def install_url(state: str) -> str:
+    """Where to send a user who wants to grant Sentinels write access.
+
+    A *different* flow from `authorize_url` above, and the distinction is the
+    whole point: signing in proves who someone is, installing grants
+    permission to write to their repositories. Someone can sign in and never
+    install — the app has to work for them, just without autofix.
+
+    `state` is round-tripped exactly as in sign-in, and checked on the way
+    back for exactly the same reason: it ties GitHub's redirect to the browser
+    session that actually started the flow.
+    """
+    return f"https://github.com/apps/{get_app_slug() or ''}/installations/new?state={state}"
+
+
 @dataclass
 class GitHubIdentity:
     """The only three things Sentinels keeps from a sign-in."""

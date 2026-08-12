@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 import secrets
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,12 +35,14 @@ from ai.chat import answer as chat_answer  # noqa: E402
 from ai.client import get_api_key  # noqa: E402
 from ai.fixes import get_or_generate_fix  # noqa: E402
 from ai.prompts import PROMPT_VERSION  # noqa: E402
-from auth.deps import current_user  # noqa: E402
+from auth.deps import current_user, optional_user  # noqa: E402
 from auth.github_oauth import (  # noqa: E402
     authorize_url,
     exchange_code,
     fetch_identity,
+    get_app_slug,
     get_frontend_origin,
+    install_url,
     missing_settings,
     oauth_configured,
 )
@@ -54,15 +57,18 @@ from auth.session import (  # noqa: E402
     token_from_cookie,
 )
 from db import init_db  # noqa: E402
-from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixPlan, FixSuggestion, RepoFileEntry, ScanReport, ScanRequest, ScanSummary, User  # noqa: E402
+from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixApplication, FixApplyPreview, FixPlan, FixSuggestion, GitHubInstallation, RepoFileEntry, ScanReport, ScanRequest, ScanSummary, User  # noqa: E402
 from orchestrator import run_scan, run_scan_stream  # noqa: E402
+from remediation.apply import ApplyError, apply_fixes, refresh_applications  # noqa: E402
 from remediation.patch import PlanValidationError  # noqa: E402
 from remediation.planning import NotARepoScan, build_bundle_zip, plan_and_save, preview_plan  # noqa: E402
+from remediation.tokens import fetch_installation  # noqa: E402
 from repo_orchestrator import run_repo_scan, run_repo_scan_stream  # noqa: E402
 from report.pdf import generate_pdf  # noqa: E402
 from report.registry import get_exporter, list_formats  # noqa: E402
 from storage.chat import load_messages  # noqa: E402
 from storage.fixes import load_fixes_for_scan  # noqa: E402
+from storage.installations import list_installations, revoke_installation, save_installation  # noqa: E402
 from storage.repo_files import get_repo_files  # noqa: E402
 from storage.scans import delete_scan, get_scan, list_scans, scan_owner, update_checklist_item  # noqa: E402
 from storage.users import delete_session, sign_in  # noqa: E402
@@ -239,6 +245,106 @@ def auth_logout(request: Request) -> Response:
     response = Response(status_code=204)
     response.delete_cookie(**_COOKIE_KWARGS)
     return response
+
+
+@app.get("/auth/github/install")
+def auth_install(user: User = Depends(current_user)) -> RedirectResponse:
+    """Send a signed-in user to GitHub to install the App on their account.
+
+    Requires a session, unlike `/auth/github/login`: the callback has to know
+    which Sentinels user the resulting installation belongs to, and there is
+    nobody to attribute it to if the browser arrives here anonymous.
+    """
+    if get_app_slug() is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Repository access is not configured. Missing: GITHUB_APP_SLUG.",
+        )
+    state = secrets.token_urlsafe(24)
+    response = RedirectResponse(install_url(state))
+    response.set_cookie(
+        "sentinels_install_state", state, httponly=True, samesite="lax", max_age=600, path="/",
+    )
+    return response
+
+
+@app.get("/auth/github/install/callback")
+async def auth_install_callback(
+    request: Request,
+    installation_id: int = 0,
+    setup_action: str = "",
+    state: str = "",
+) -> RedirectResponse:
+    """GitHub's landing point after the user installs (or configures) the App.
+
+    There is no code-for-token exchange here, and none is needed to trust the
+    result: GitHub only redirects to this URL after the person signed in *on
+    github.com* completed the install screen for that installation, and the
+    `state` cookie ties that redirect to this Sentinels session. What the
+    callback still has to do is ask GitHub *which account* the installation
+    covers — the redirect carries only a number, and `account_login` is what
+    every later write check compares against.
+    """
+    frontend = get_frontend_origin()
+    expected_state = request.cookies.get("sentinels_install_state")
+
+    def _fail(reason: str) -> RedirectResponse:
+        response = RedirectResponse(f"{frontend}/settings?install_error={reason}")
+        response.delete_cookie("sentinels_install_state", path="/")
+        return response
+
+    if not expected_state or not state or state != expected_state:
+        return _fail("state_mismatch")
+    if not installation_id:
+        return _fail("missing_installation")
+
+    user = optional_user(request)
+    if user is None:
+        return _fail("not_signed_in")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        metadata = await fetch_installation(client, installation_id)
+    if metadata is None:
+        return _fail("installation_lookup_failed")
+
+    account = (metadata.get("account") or {}).get("login")
+    if not isinstance(account, str) or not account:
+        return _fail("installation_lookup_failed")
+
+    save_installation(
+        user_id=user.id,
+        installation_id=installation_id,
+        account_login=account,
+        repo_selection=metadata.get("repository_selection") or "selected",
+        permissions=metadata.get("permissions") or {},
+    )
+
+    response = RedirectResponse(f"{frontend}/settings?installed={account}")
+    response.delete_cookie("sentinels_install_state", path="/")
+    return response
+
+
+@app.get("/installations", response_model=list[GitHubInstallation])
+def installations_list(user: User = Depends(current_user)) -> list[GitHubInstallation]:
+    """The repository-write grants this user currently holds."""
+    return list_installations(user.id)
+
+
+@app.post("/installations/{installation_id}/revoke")
+def installations_revoke(
+    installation_id: int, user: User = Depends(current_user)
+) -> Response:
+    """Stop Sentinels using one installation. 404 if the caller has no live
+    grant with that id — including when it belongs to somebody else, which is
+    deliberately indistinguishable from "no such installation".
+
+    This is only half a revocation, and the response says so: the App stays
+    installed on GitHub until the user removes it there. Sentinels can only
+    promise to stop using it, which is what this row now records.
+    """
+    if not revoke_installation(user.id, installation_id):
+        raise HTTPException(status_code=404, detail="No active installation with that id.")
+    return Response(status_code=204)
 
 
 @app.post("/scan", response_model=ScanReport)
@@ -581,6 +687,57 @@ def scan_fix_bundle(scan_id: str, user: User = Depends(current_user)) -> Respons
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="sentinels-fixes-{scan_id[:8]}.zip"'},
     )
+
+
+class FixApplyRequest(BaseModel):
+    finding_keys: list[str]
+    # Defaults to a dry run on purpose. A request that forgets the flag
+    # previews; it never pushes. The dangerous option has to be typed.
+    dry_run: bool = True
+
+
+# `response_model=None` because this endpoint returns one of two shapes and
+# they overlap: every field `FixApplyResult` requires also exists on
+# `FixApplyPreview`, so a declared union would let pydantic validate a preview
+# *as* a result and silently drop the diff. Returning the model unchanged is
+# both simpler and the only version that cannot lose data.
+@app.post("/scans/{scan_id}/fix/apply", response_model=None)
+async def scan_fix_apply(
+    scan_id: str, body: FixApplyRequest, user: User = Depends(current_user)
+) -> FixApplyPreview | FixApplyResult:
+    """Open one pull request containing the saved fix plans for the requested
+    findings (PLAN-v5 Stage B).
+
+    With `dry_run` (the default), every check runs and nothing is written —
+    the response is exactly what *would* be pushed. With `dry_run: false`,
+    the same checks run and then one branch, one commit, and one pull request
+    are created. Sentinels never merges it.
+    """
+    report = get_scan(scan_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"Scan {scan_id!r} not found")
+
+    try:
+        return await apply_fixes(report, user, body.finding_keys, dry_run=body.dry_run)
+    except ApplyError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@app.get("/scans/{scan_id}/fix/applications", response_model=list[FixApplication])
+async def scan_fix_applications(
+    scan_id: str, user: User = Depends(current_user)
+) -> list[FixApplication]:
+    """The remediation history for one scan, with any still-open pull request
+    re-read from GitHub first.
+
+    Stage C decides whether to re-verify based on whether a PR merged, so
+    `state` has to reflect GitHub's answer rather than what Sentinels last
+    happened to see.
+    """
+    report = get_scan(scan_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"Scan {scan_id!r} not found")
+    return await refresh_applications(report, user)
 
 
 class ChatQuestion(BaseModel):

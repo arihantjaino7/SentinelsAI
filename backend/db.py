@@ -258,6 +258,61 @@ CREATE TABLE audit_log (
 CREATE INDEX idx_audit_log_scan ON audit_log(scan_id);
 """
 
+# PLAN-v5 Stage B (conflict #9): an audit row must never depend on a plan row
+# surviving. `fix_plans` is INSERT OR REPLACE'd on every re-plan, which hands the
+# row a *new* autoincrement id -- so the old `ON DELETE CASCADE` meant re-planning
+# an already-applied finding would silently delete its `fix_applications` row,
+# destroying the record of a PR that might still be open or already merged.
+#
+# Two changes fix that, and one enforces idempotency:
+#
+#   1. `plan_json` -- an immutable snapshot of the exact FixPlan that was applied.
+#      The audit record now carries its own copy of what happened, so it stays
+#      complete even if `fix_plans` changes or the row disappears entirely.
+#   2. `fix_plan_id` becomes nullable with ON DELETE SET NULL -- a convenient
+#      pointer at the live plan, never a dependency.
+#   3. A *partial* unique index (the `WHERE` clause) -- SQLite only indexes rows
+#      matching it, so a scan can hold many failed/abandoned attempts for one
+#      finding but only ever one live application. This is the DB-level backstop
+#      for the idempotency check in `remediation/apply.py`, not a replacement:
+#      the application-level check runs first and gives a usable error message.
+#
+# SQLite cannot ALTER a foreign key in place, so the table is rebuilt through the
+# standard create-new/copy/drop/rename sequence -- the same dance any SQLite FK
+# change requires. `fix_applications` is empty in every database that exists
+# today (Stage A never wrote a row), so the copy is a formality that keeps the
+# migration correct for anyone who does have data.
+_V12_SCHEMA = """
+CREATE TABLE fix_applications_new (
+    id          TEXT PRIMARY KEY,            -- uuid4
+    scan_id     TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    fix_plan_id INTEGER REFERENCES fix_plans(id) ON DELETE SET NULL,
+    finding_key TEXT NOT NULL,
+    fixer_slug  TEXT NOT NULL,
+    tier        INTEGER NOT NULL,
+    state       TEXT NOT NULL,                -- planned|pr_open|merged|verified|failed|abandoned
+    pr_url      TEXT,
+    pr_number   INTEGER,
+    branch      TEXT,
+    plan_json   TEXT NOT NULL DEFAULT '',     -- frozen snapshot of the applied FixPlan
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+INSERT INTO fix_applications_new
+    (id, scan_id, fix_plan_id, finding_key, fixer_slug, tier, state, pr_url, branch, created_at, updated_at)
+SELECT id, scan_id, fix_plan_id, finding_key, fixer_slug, tier, state, pr_url, branch, created_at, updated_at
+FROM fix_applications;
+
+DROP TABLE fix_applications;
+ALTER TABLE fix_applications_new RENAME TO fix_applications;
+
+CREATE INDEX idx_fix_applications_scan ON fix_applications(scan_id);
+CREATE UNIQUE INDEX idx_fix_applications_active
+    ON fix_applications(scan_id, finding_key)
+    WHERE state NOT IN ('failed', 'abandoned');
+"""
+
 # Each entry is (version, schema sql to apply to go from version-1 to version).
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _V1_SCHEMA),
@@ -271,6 +326,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (9, _V9_SCHEMA),
     (10, _V10_SCHEMA),
     (11, _V11_SCHEMA),
+    (12, _V12_SCHEMA),
 ]
 
 

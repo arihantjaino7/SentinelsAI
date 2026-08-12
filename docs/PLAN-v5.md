@@ -61,6 +61,41 @@
 > `tsc --noEmit` clean. Nothing in this stage writes to GitHub. Notes:
 > [`learning/59-deterministic-fixers-and-unified-diffs.md`](learning/59-deterministic-fixers-and-unified-diffs.md),
 > [`learning/60-the-diff-preview-ui.md`](learning/60-the-diff-preview-ui.md).
+>
+> Stage B implemented 2026-08-12 — **backend only; not yet run against a real
+> repository**, so per the definition of done below this is not "the flow works"
+> until a real PR URL exists (steps 12–16 remain the developer's). Migration
+> `(12, _V12_SCHEMA)` rebuilds `fix_applications` (SQLite cannot ALTER a FK in
+> place): adds `plan_json` + `pr_number`, makes `fix_plan_id` nullable /
+> `ON DELETE SET NULL`, and adds the partial unique index on
+> `(scan_id, finding_key) WHERE state NOT IN ('failed','abandoned')` — all three
+> of invariants #1, #2 and the idempotency backstop. New models: `GitHubInstallation`,
+> `FixApplyPreview`, `FixApplyResult`; `FixApplication` gains `pr_number` and a
+> `plan` snapshot. New: `backend/storage/installations.py`, `remediation/tokens.py`
+> (`app_jwt` RS256/9-min, `AppTokenProvider`, `DevTokenProvider` behind two
+> switches, `fetch_installation`), `remediation/github.py` (`GitHubWriter` +
+> `commit_files`; deliberately has **no** `update_ref`/`merge` method — rule 5
+> enforced by absence, with a test asserting it), `remediation/pr_body.py`
+> (branch/commit/title/body, per-fixer "what this does *not* fix" table with a
+> generic fallback), `remediation/apply.py` (the ten-step sequence; every refusal
+> before the first write). `storage/remediation.py` gained the `fix_applications`
+> + `audit_log` half. Six new routes: `GET /auth/github/install`,
+> `GET /auth/github/install/callback`, `GET /installations`,
+> `POST /installations/{id}/revoke`, `POST /scans/{id}/fix/apply` (`dry_run`
+> defaults to **true**), `GET /scans/{id}/fix/applications` (live PR-state
+> refresh). First new dependencies since Stage 0: `PyJWT`, `cryptography`.
+> Conflict #11 recorded and resolved (token minted before the drift read).
+> Found in passing: `POST .../fix/apply` needed `response_model=None` — its two
+> return shapes overlap enough that a declared union let pydantic validate a
+> preview *as* a result and drop the diff. 321 tests green (88 new:
+> `test_remediation_{tokens,github,pr_body,apply}.py`,
+> `test_storage_{installations,fix_applications}.py`), all offline/mocked, plus a
+> 14-check `TestClient` pass over the new routes (auth gating, dry-run writes
+> nothing, live apply opens one PR, repeat apply returns the same PR, state
+> refresh to `merged`, revoke blocks apply). Nothing in this stage is wired to the
+> frontend yet — deliberately, per step 7. Notes:
+> [`learning/61-github-apps-and-installation-tokens.md`](learning/61-github-apps-and-installation-tokens.md),
+> [`learning/62-committing-without-a-clone.md`](learning/62-committing-without-a-clone.md).
 
 ---
 
@@ -137,6 +172,15 @@ Recorded here because each one changed the design:
     mint an installation token without first knowing which installation belongs to
     which user's which repo, so a small install-linking flow (§Stage B) has to exist
     before `tokens.py` has anything to mint against.
+11. **The drift re-check needs the installation token too.** Stage B's step order
+    below mints the token at step 9, immediately before the first write, with the
+    step-5 drift re-check reading through `source.get_file` unauthenticated. That
+    breaks on a private repository: an unauthenticated Contents API call 404s, and
+    the drift check would honestly but *wrongly* report "the file was deleted".
+    Resolved by minting the token right after the installation lookup and using it
+    for the reads as well — minting writes nothing, so `dry_run` still touches no
+    state, and step 7 still stops before the first write. Recorded here rather than
+    silently reordered.
 
 ---
 
@@ -379,11 +423,14 @@ working fixers beat twenty half-working ones.
 ## What only the developer can do
 
 Register the GitHub App (github.com/settings/apps): name "Sentinels Autofix", callback
-`http://localhost:8011/auth/github/callback`, permissions **Contents R/W, Pull requests
-R/W, Metadata R, Workflows R/W** (the last only because pinning edits
-`.github/workflows/*`). Generate a private key, store the `.pem` outside the repo, put the
-App ID / client ID / client secret / key path in `backend/.env`. Never paste any of them
-into chat.
+`http://localhost:8011/auth/github/callback`, **Setup URL**
+`http://localhost:8011/auth/github/install/callback` with "Redirect on update" enabled
+(this is what the Stage B install flow lands on — a *different* field from the callback
+URL above), permissions **Contents R/W, Pull requests R/W, Metadata R, Workflows R/W**
+(the last only because pinning edits `.github/workflows/*`). Generate a private key, store
+the `.pem` outside the repo, put the App ID / slug / client ID / client secret / key path
+in `backend/.env` (see `backend/.env.example` for the exact variable names). Never paste
+any of them into chat.
 
 Create a throwaway public repo containing a **third-party** GitHub Action, no `.gitignore`,
 and a Dockerfile with no `USER` — the Stage B/C test target.

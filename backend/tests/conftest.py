@@ -48,6 +48,45 @@ def mock_site() -> Callable[[Routes], httpx.AsyncClient]:
     return _make
 
 
+# {(method, path): (status_code, json body)}
+ApiRoutes = dict[tuple[str, str], tuple[int, object]]
+
+
+@pytest.fixture
+def mock_api() -> Callable[[ApiRoutes], httpx.AsyncClient]:
+    """Like `mock_site`, but keyed on (method, path) and speaking JSON.
+
+    PLAN-v5 Stage B needs this because GitHub's Git Data API distinguishes
+    `POST /git/refs` (create a branch) from `DELETE /git/refs/heads/x` (remove
+    one) at the same-ish path — a path-only mock cannot tell a write from its
+    cleanup, which is precisely what the orphan-branch tests have to check.
+
+    Every call is also recorded on `client.calls`, so a test can assert on the
+    *order* things happened in — blob before tree before commit before ref is
+    a correctness property of this flow, not an implementation detail.
+    """
+
+    def _make(routes: ApiRoutes, base_url: str = "https://api.github.com") -> httpx.AsyncClient:
+        calls: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            key = (request.method, request.url.path)
+            calls.append(key)
+            entry = routes.get(key)
+            if entry is None:
+                return httpx.Response(404, json={"message": "Not Found"})
+            status, body = entry
+            if body is None:
+                return httpx.Response(status)
+            return httpx.Response(status, json=body)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url=base_url)
+        client.calls = calls  # type: ignore[attr-defined]
+        return client
+
+    return _make
+
+
 @pytest.fixture
 def temp_db(tmp_path, monkeypatch):
     """Point `db.DB_PATH` at a throwaway file for this test only, so storage
