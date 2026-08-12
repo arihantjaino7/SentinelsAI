@@ -313,6 +313,18 @@ CREATE UNIQUE INDEX idx_fix_applications_active
     WHERE state NOT IN ('failed', 'abandoned');
 """
 
+# V13 (PLAN-v5 Stage C): the verification a fix was actually closed out with --
+# the score before, the score after, and which of the agent's findings really
+# went away. Stored as JSON on the application row rather than in its own table
+# because it is one-to-one with an application and never queried across rows:
+# it is the *evidence* for that row's `verified` state, not a separate record.
+#
+# A plain ADD COLUMN this time -- nothing about the table's constraints changes,
+# so none of migration 12's rebuild dance is needed.
+_V13_SCHEMA = """
+ALTER TABLE fix_applications ADD COLUMN verification_json TEXT;
+"""
+
 # Each entry is (version, schema sql to apply to go from version-1 to version).
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _V1_SCHEMA),
@@ -327,6 +339,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (10, _V10_SCHEMA),
     (11, _V11_SCHEMA),
     (12, _V12_SCHEMA),
+    (13, _V13_SCHEMA),
 ]
 
 

@@ -66,12 +66,13 @@ from auth.session import (  # noqa: E402
     token_from_cookie,
 )
 from db import init_db  # noqa: E402
-from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixApplication, FixApplyPreview, FixPlan, FixSuggestion, GitHubInstallation, RepoFileEntry, ScanReport, ScanRequest, ScanSummary, User  # noqa: E402
+from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixApplication, FixApplyPreview, FixPlan, FixSuggestion, GitHubInstallation, RepoFileEntry, ScanReport, ScanRequest, ScanSummary, User, VerificationResult  # noqa: E402
 from orchestrator import run_scan, run_scan_stream  # noqa: E402
 from remediation.apply import ApplyError, apply_fixes, refresh_applications  # noqa: E402
 from remediation.patch import PlanValidationError  # noqa: E402
 from remediation.planning import NotARepoScan, build_bundle_zip, plan_and_save, preview_plan  # noqa: E402
 from remediation.tokens import fetch_installation  # noqa: E402
+from remediation.verify import VerifyError, verify_finding  # noqa: E402
 from repo_orchestrator import run_repo_scan, run_repo_scan_stream  # noqa: E402
 from report.pdf import generate_pdf  # noqa: E402
 from report.registry import get_exporter, list_formats  # noqa: E402
@@ -747,6 +748,32 @@ async def scan_fix_applications(
     if report is None:
         raise HTTPException(status_code=404, detail=f"Scan {scan_id!r} not found")
     return await refresh_applications(report, user)
+
+
+@app.post(
+    "/scans/{scan_id}/findings/{finding_key}/verify", response_model=VerificationResult
+)
+async def finding_verify(
+    scan_id: str, finding_key: str, user: User = Depends(current_user)
+) -> VerificationResult:
+    """Re-run the agent responsible for one finding and report what changed
+    (PLAN-v5 Stage C).
+
+    Downloads the repository again, runs exactly that one agent, and returns
+    the real before/after score from the untouched deterministic scorer. When
+    a fix Sentinels opened has merged, the matching `fix_applications` row
+    moves to `verified` and keeps this result as its evidence; a pull request
+    that hasn't merged yet is refused rather than verified against the old
+    state of the repository.
+    """
+    report = get_scan(scan_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"Scan {scan_id!r} not found")
+
+    try:
+        return await verify_finding(report, user, finding_key)
+    except VerifyError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 
 class ChatQuestion(BaseModel):

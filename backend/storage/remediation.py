@@ -16,7 +16,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from db import get_connection
-from models import FixApplication, FixApplicationState, FixPlan
+from models import FixApplication, FixApplicationState, FixPlan, VerificationResult
+from remediation.states import check_transition
 
 # States that mean "this attempt is over" -- and therefore no longer occupy
 # the one active slot a (scan, finding) pair is allowed. Kept here next to the
@@ -100,6 +101,7 @@ def fix_plan_row_id(scan_id: str, finding_key: str) -> int | None:
 
 def _row_to_application(row: sqlite3.Row) -> FixApplication:
     plan_json = row["plan_json"]
+    verification_json = row["verification_json"]
     return FixApplication(
         id=row["id"],
         scan_id=row["scan_id"],
@@ -111,6 +113,11 @@ def _row_to_application(row: sqlite3.Row) -> FixApplication:
         pr_number=row["pr_number"],
         branch=row["branch"],
         plan=FixPlan.model_validate_json(plan_json) if plan_json else None,
+        verification=(
+            VerificationResult.model_validate_json(verification_json)
+            if verification_json
+            else None
+        ),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -210,16 +217,74 @@ def active_fix_applications(scan_id: str, finding_keys: list[str]) -> dict[str, 
         conn.close()
 
 
+def get_fix_application(application_id: str) -> FixApplication | None:
+    """One application row by id, or `None` if it isn't there."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM fix_applications WHERE id = ?", (application_id,)
+        ).fetchone()
+        return _row_to_application(row) if row is not None else None
+    finally:
+        conn.close()
+
+
 def update_fix_application_state(
     application_id: str, state: FixApplicationState
 ) -> None:
     """Move one application to a new state (Stage B closes PRs, Stage C
-    verifies them)."""
+    verifies them).
+
+    The move is checked against `remediation/states.py` first. An audit row
+    that can jump straight from `planned` to `verified` is not an audit row —
+    it would claim a merge and a re-observation that never happened — so an
+    illegal transition raises instead of writing.
+    """
     conn = get_connection()
     try:
+        row = conn.execute(
+            "SELECT state FROM fix_applications WHERE id = ?", (application_id,)
+        ).fetchone()
+        if row is None:
+            return
+        check_transition(FixApplicationState(row["state"]), state)
         conn.execute(
             "UPDATE fix_applications SET state = ?, updated_at = ? WHERE id = ?",
             (state.value, datetime.now(timezone.utc).isoformat(), application_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_verification(application_id: str, result: VerificationResult) -> None:
+    """Record what re-running the agent showed, and move the row to
+    `verified` (PLAN-v5 Stage C).
+
+    One statement writes both, so a row can never end up `verified` with no
+    evidence attached, or hold evidence while still claiming to be merely
+    `merged`. The transition is checked first, same as above.
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT state FROM fix_applications WHERE id = ?", (application_id,)
+        ).fetchone()
+        if row is None:
+            return
+        check_transition(FixApplicationState(row["state"]), FixApplicationState.VERIFIED)
+        conn.execute(
+            """
+            UPDATE fix_applications
+               SET state = ?, verification_json = ?, updated_at = ?
+             WHERE id = ?
+            """,
+            (
+                FixApplicationState.VERIFIED.value,
+                result.model_dump_json(),
+                datetime.now(timezone.utc).isoformat(),
+                application_id,
+            ),
         )
         conn.commit()
     finally:

@@ -9,15 +9,18 @@ import sqlite3
 import pytest
 
 from db import get_connection
-from models import FilePatch, FixApplicationState, FixPlan
+from models import FilePatch, FixApplicationState, FixPlan, VerificationResult
+from remediation.states import InvalidTransition
 from storage.remediation import (
     active_fix_applications,
     count_prs_for_scan,
     count_prs_since,
+    get_fix_application,
     list_audit,
     list_fix_applications,
     save_fix_application,
     save_fix_plan,
+    save_verification,
     update_fix_application_state,
     write_audit,
 )
@@ -46,6 +49,22 @@ def _plan(finding_key: str = "gitignore-present") -> FixPlan:
         summary="Add a .gitignore",
         patches=[FilePatch(path=".gitignore", action="create", new_content=".env\n", diff="+.env")],
         created_at="2026-01-01T00:00:00+00:00",
+    )
+
+
+def _verification(scan_id: str = "scan1") -> VerificationResult:
+    return VerificationResult(
+        scan_id=scan_id,
+        finding_key="gitignore-present",
+        agent="repo-config",
+        ref="main",
+        verified_at="2026-08-12T12:00:00+00:00",
+        before=84,
+        after=92,
+        delta=8,
+        target_fixed=True,
+        fixed=["gitignore-present"],
+        still_failing=[],
     )
 
 
@@ -154,3 +173,64 @@ def test_audit_rows_are_written_and_read_back_in_order(temp_db):
     rows = list_audit("scan1")
     assert [row["action"] for row in rows] == ["pr_opened", "pr_merged"]
     assert rows[0]["detail"] == "branch=b pr=#1"
+
+
+# --- Stage C: state-transition enforcement and the verification snapshot ----
+
+def test_an_illegal_state_transition_raises_instead_of_writing(temp_db):
+    """An audit row that could jump straight from `planned` to `verified`
+    would be claiming a merge and a re-observation that never happened."""
+    _insert_bare_scan("scan1")
+    application = save_fix_application(
+        "scan1", _plan(), FixApplicationState.PLANNED, branch=None
+    )
+    with pytest.raises(InvalidTransition):
+        update_fix_application_state(application.id, FixApplicationState.VERIFIED)
+    assert list_fix_applications("scan1")[0].state == FixApplicationState.PLANNED
+
+
+def test_an_attempt_can_always_be_marked_abandoned(temp_db):
+    _insert_bare_scan("scan1")
+    application = save_fix_application(
+        "scan1", _plan(), FixApplicationState.PR_OPEN, branch="b", pr_number=1
+    )
+    update_fix_application_state(application.id, FixApplicationState.ABANDONED)
+    assert list_fix_applications("scan1")[0].state == FixApplicationState.ABANDONED
+
+
+def test_saving_a_verification_sets_the_state_and_the_evidence_together(temp_db):
+    _insert_bare_scan("scan1")
+    application = save_fix_application(
+        "scan1", _plan(), FixApplicationState.MERGED, branch="b", pr_number=1
+    )
+    save_verification(application.id, _verification())
+
+    stored = get_fix_application(application.id)
+    assert stored is not None
+    assert stored.state == FixApplicationState.VERIFIED
+    assert stored.verification is not None
+    assert stored.verification.delta == 8
+    assert stored.verification.fixed == ["gitignore-present"]
+
+
+def test_a_verification_cannot_be_recorded_before_the_pr_merges(temp_db):
+    _insert_bare_scan("scan1")
+    application = save_fix_application(
+        "scan1", _plan(), FixApplicationState.PR_OPEN, branch="b", pr_number=1
+    )
+    with pytest.raises(InvalidTransition):
+        save_verification(application.id, _verification())
+
+    stored = get_fix_application(application.id)
+    assert stored.state == FixApplicationState.PR_OPEN
+    assert stored.verification is None
+
+
+def test_a_row_with_no_verification_reads_back_as_none(temp_db):
+    """Migration 13 added a nullable column; every row written before it must
+    still load."""
+    _insert_bare_scan("scan1")
+    application = save_fix_application(
+        "scan1", _plan(), FixApplicationState.MERGED, branch="b", pr_number=1
+    )
+    assert get_fix_application(application.id).verification is None

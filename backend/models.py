@@ -284,6 +284,36 @@ class FixApplicationState(str, Enum):
     ABANDONED = "abandoned"
 
 
+class VerificationResult(BaseModel):
+    """What re-running one agent actually observed after a fix was merged
+    (PLAN-v5 Stage C).
+
+    Every number here comes from the untouched deterministic
+    `scoring.calculate_score` over real, freshly observed findings — never
+    from a model, and never from assuming that writing a patch worked
+    (CLAUDE.md's "verification closes the loop"). `before` is recomputed from
+    the stored report rather than read off `ScanReport.score`, so both sides
+    of the delta come out of the same function on the same day.
+    """
+
+    scan_id: str
+    finding_key: str                         # the Finding.id this verified
+    agent: str                               # the agent slug that was re-run
+    ref: str                                 # the git ref the re-run observed
+    verified_at: str                         # ISO 8601 UTC
+
+    before: int                              # score with the stored findings
+    after: int                               # score with this agent's fresh findings
+    delta: int                               # after - before; positive is an improvement
+
+    target_fixed: bool                       # the verified finding itself: FAIL -> gone
+    fixed: list[str] = Field(default_factory=list)          # ids this agent no longer reports
+    still_failing: list[str] = Field(default_factory=list)  # ids it still reports
+
+    application_id: Optional[str] = None     # the fix_applications row, when there is one
+    recorded: bool = False                   # whether that row was updated to `verified`
+
+
 class FixApplication(BaseModel):
     """One row of the remediation audit trail -- a FixPlan someone acted on.
 
@@ -304,6 +334,7 @@ class FixApplication(BaseModel):
     pr_number: Optional[int] = None
     branch: Optional[str] = None
     plan: Optional[FixPlan] = None           # the immutable snapshot
+    verification: Optional[VerificationResult] = None  # Stage C, once the fix was re-observed
     created_at: str
     updated_at: str
 
