@@ -819,7 +819,30 @@ pass over both endpoints (401 unauthenticated, 403 on `GET /scans/{id}/audit` fo
 another user's scan); one live pass reading the real audit history this project has
 already accumulated (the Stage B/C real-PR rows, Stage D's live link-repo pass) —
 the first time any of it will have been *seen*, not just written.
-**Note:** planned, once implemented.
+**Note:** [`learning/67-the-audit-browser.md`](learning/67-the-audit-browser.md).
+
+**Done, 2026-08-13.** One correction to this section's own wording, caught while
+writing the ownership check: `GET /scans/{id}/audit` does **not**, in the end, check
+ownership "the same way `GET /scans/{id}/fix/applications` already is" — that endpoint
+never actually refuses a non-owner, it only skips the live GitHub refresh for one.
+`GET /scans/{id}/audit` refuses outright (403) for a scan owned by someone else, the
+stricter invariant-#3-style check `POST /scans/{id}/fix/apply` uses — because who-did-
+what across every scan is exactly the thing that must not leak between accounts, and
+that bar was always the intent here even though the cross-reference above named the
+wrong precedent.
+
+`list_audit_for_user` uses a `LEFT JOIN` against `scans` (this project's first) so a
+row survives even after its scan is deleted (`audit_log.scan_id` is `ON DELETE SET
+NULL`) — a plain `JOIN` would have silently dropped it. 422 backend tests green (10
+new: 3 offline storage tests in `test_storage_fix_applications.py`, 7 in the new
+`test_main_audit.py` — this project's first use of `fastapi.testclient.TestClient`
+rather than calling route logic directly, made cheap here because neither route talks
+to GitHub). `tsc --noEmit` and ESLint clean on every new/touched frontend file (the
+same three pre-existing ESLint errors elsewhere, untouched). Live-verified against a
+real signed-in session and the real accumulated history from Stages B–D: the
+account-wide `/audit` page correctly showed the real `some-action-v1` PR-opened/
+PR-merged/fix-verified rows newest-first, and the per-scan `/audit?scan=...` view
+(reached via the new nav link) showed the same rows scoped to that one scan.
 
 ---
 

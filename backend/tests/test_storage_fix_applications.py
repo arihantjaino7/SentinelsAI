@@ -17,6 +17,7 @@ from storage.remediation import (
     count_prs_since,
     get_fix_application,
     list_audit,
+    list_audit_for_user,
     list_fix_applications,
     save_fix_application,
     save_fix_plan,
@@ -24,6 +25,21 @@ from storage.remediation import (
     update_fix_application_state,
     write_audit,
 )
+
+
+def _insert_bare_user(user_id: int) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO users (id, github_id, github_login, avatar_url, created_at, last_seen_at)
+            VALUES (?, ?, ?, NULL, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+            """,
+            (user_id, 1000 + user_id, f"user{user_id}"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _insert_bare_scan(scan_id: str) -> None:
@@ -173,6 +189,40 @@ def test_audit_rows_are_written_and_read_back_in_order(temp_db):
     rows = list_audit("scan1")
     assert [row["action"] for row in rows] == ["pr_opened", "pr_merged"]
     assert rows[0]["detail"] == "branch=b pr=#1"
+
+
+# --- Stage E: the account-wide audit view ------------------------------------
+
+
+def test_list_audit_for_user_is_newest_first_and_scoped_to_that_user(temp_db):
+    _insert_bare_user(1)
+    _insert_bare_user(2)
+    _insert_bare_scan("scan1")
+    _insert_bare_scan("scan2")
+    write_audit(1, "scan1", "gitignore-present", "pr_opened", "first")
+    write_audit(1, "scan2", "docker-root-user-Dockerfile", "pr_merged", "second")
+    write_audit(2, "scan1", "gitignore-present", "pr_opened", "someone else's row")
+
+    rows = list_audit_for_user(1)
+    assert [row["action"] for row in rows] == ["pr_merged", "pr_opened"]
+    assert all(row["user_id"] == 1 for row in rows)
+
+
+def test_list_audit_for_user_carries_its_scan_context(temp_db):
+    _insert_bare_user(1)
+    _insert_bare_scan("scan1")
+    write_audit(1, "scan1", "gitignore-present", "pr_opened", "detail")
+    row = list_audit_for_user(1)[0]
+    assert row["scan_url"] == "https://github.com/octo/demo"
+    assert row["scan_target_type"] == "repo"
+
+
+def test_list_audit_for_user_respects_the_limit(temp_db):
+    _insert_bare_user(1)
+    _insert_bare_scan("scan1")
+    for i in range(5):
+        write_audit(1, "scan1", "gitignore-present", "pr_opened", str(i))
+    assert len(list_audit_for_user(1, limit=2)) == 2
 
 
 # --- Stage C: state-transition enforcement and the verification snapshot ----

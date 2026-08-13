@@ -134,12 +134,23 @@ export default function SettingsPage() {
 
   return (
     <main className="mx-auto w-full max-w-3xl px-6 py-20 sm:px-8">
-      <Link
-        href="/"
-        className="font-mono text-xs uppercase tracking-[0.35em] text-muted transition-colors hover:text-parchment"
-      >
-        Sentinels
-      </Link>
+      <div className="flex items-center justify-between">
+        <Link
+          href="/"
+          className="font-mono text-xs uppercase tracking-[0.35em] text-muted transition-colors hover:text-parchment"
+        >
+          Sentinels
+        </Link>
+        {/* PLAN-v5 Stage E: the audit browser's other entry point besides the
+            per-scan nav — Settings and Audit are the two account-wide pages,
+            so each links to the other. */}
+        <Link
+          href="/audit"
+          className="font-mono text-xs uppercase tracking-[0.2em] text-muted transition-colors hover:text-parchment"
+        >
+          Audit
+        </Link>
+      </div>
 
       <h1 className="mt-8 font-display text-5xl sm:text-6xl">Settings</h1>
 

@@ -441,3 +441,26 @@ class RepoFileEntry(BaseModel):
     size: int
     language: Optional[str] = None
     finding_count: int = 0
+
+
+class AuditLogEntry(BaseModel):
+    """One row of `audit_log`, read back (PLAN-v5 Stage E) -- the same rows
+    `write_audit` has produced since Stage B, now surfaced instead of being
+    reachable only by a direct query.
+
+    `scan_url`/`scan_target_type` are carried alongside `scan_id` rather than
+    making the frontend resolve the scan itself: the account-wide `/audit`
+    view spans every scan a user has ever touched, so each row has to be
+    legible on its own. Both are `None` when the scan no longer exists
+    (`audit_log.scan_id` is `ON DELETE SET NULL`) -- the row still means
+    something, it just has nowhere left to link to.
+    """
+
+    id: int
+    scan_id: Optional[str] = None
+    scan_url: Optional[str] = None
+    scan_target_type: Optional[str] = None
+    finding_key: Optional[str] = None
+    action: str                  # e.g. "pr_opened", "pr_merged", "fix_verified"
+    detail: str = ""
+    created_at: str

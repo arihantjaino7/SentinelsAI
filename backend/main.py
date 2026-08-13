@@ -66,7 +66,7 @@ from auth.session import (  # noqa: E402
     token_from_cookie,
 )
 from db import init_db  # noqa: E402
-from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixApplication, FixApplyPreview, FixPlan, FixSuggestion, FixSummary, GitHubInstallation, RepoFileEntry, ScanReport, ScanRepoLink, ScanRequest, ScanSummary, User, VerificationResult  # noqa: E402
+from models import AgentInfo, AgentResult, AuditLogEntry, ChatMessage, ChecklistItem, FixApplication, FixApplyPreview, FixPlan, FixSuggestion, FixSummary, GitHubInstallation, RepoFileEntry, ScanReport, ScanRepoLink, ScanRequest, ScanSummary, User, VerificationResult  # noqa: E402
 from orchestrator import run_scan, run_scan_stream  # noqa: E402
 from remediation.apply import ApplyError, apply_fixes, refresh_applications  # noqa: E402
 from remediation.patch import PlanValidationError  # noqa: E402
@@ -81,6 +81,7 @@ from storage.chat import load_messages  # noqa: E402
 from storage.fixes import load_fixes_for_scan  # noqa: E402
 from storage.installations import list_installations, revoke_installation, save_installation  # noqa: E402
 from storage.scan_links import delete_scan_repo_link, get_scan_repo_link, save_scan_repo_link  # noqa: E402
+from storage.remediation import list_audit, list_audit_for_user  # noqa: E402
 from storage.repo_files import get_repo_files  # noqa: E402
 from storage.scans import delete_scan, get_scan, list_scans, scan_owner, update_checklist_item  # noqa: E402
 from storage.users import delete_session, sign_in  # noqa: E402
@@ -357,6 +358,15 @@ def installations_revoke(
     if not revoke_installation(user.id, installation_id):
         raise HTTPException(status_code=404, detail="No active installation with that id.")
     return Response(status_code=204)
+
+
+@app.get("/audit", response_model=list[AuditLogEntry])
+def audit_list(limit: int = 100, user: User = Depends(current_user)) -> list[AuditLogEntry]:
+    """This account's recent remediation history, across every scan (PLAN-v5
+    Stage E) -- the rows `write_audit` has been recording since Stage B,
+    surfaced for the first time anywhere wider than a direct query.
+    """
+    return [AuditLogEntry(**row) for row in list_audit_for_user(user.id, limit=limit)]
 
 
 class LinkRepoRequest(BaseModel):
@@ -866,6 +876,26 @@ async def finding_verify(
         return await verify_finding(report, user, finding_key)
     except VerifyError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@app.get("/scans/{scan_id}/audit", response_model=list[AuditLogEntry])
+def scan_audit(scan_id: str, user: User = Depends(current_user)) -> list[AuditLogEntry]:
+    """The audit trail for one scan (PLAN-v5 Stage E), oldest first -- a thin,
+    ownership-checked wrapper over the same `list_audit` Stage B has written
+    to since the first pull request, never read back until now.
+
+    Unlike `GET /scans/{id}/fix/applications` (which lets any signed-in user
+    read a legacy unowned scan's history), this refuses outright for a scan
+    that belongs to someone else -- the audit trail is who-did-what, and
+    "who" is exactly what shouldn't leak across accounts.
+    """
+    report = get_scan(scan_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"Scan {scan_id!r} not found")
+    owner = scan_owner(scan_id)
+    if owner is not None and owner != user.id:
+        raise HTTPException(status_code=403, detail="This scan belongs to another user.")
+    return [AuditLogEntry(**row) for row in list_audit(scan_id)]
 
 
 class ChatQuestion(BaseModel):

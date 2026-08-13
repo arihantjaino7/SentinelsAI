@@ -729,6 +729,42 @@ export async function verifyFinding(
   return res.json() as Promise<VerificationResult>;
 }
 
+/* ---------------------------------------------------------------------------
+   PLAN-v5 Stage E: the audit browser. `audit_log` has been written since
+   Stage B — every plan, PR, and verification already lands a row — but
+   nothing read it back except tests until now.
+   --------------------------------------------------------------------------- */
+
+// Mirrors backend/models.py `AuditLogEntry`. `scan_url`/`scan_target_type`
+// ride along so a row is legible on the account-wide page, which spans every
+// scan a user has ever touched rather than living inside one scan's own.
+export interface AuditLogEntry {
+  id: number;
+  scan_id: string | null;
+  scan_url: string | null;
+  scan_target_type: string | null;
+  finding_key: string | null;
+  action: string;
+  detail: string;
+  created_at: string;
+}
+
+/** This account's remediation history, newest first, across every scan. */
+export async function fetchAudit(limit = 100): Promise<AuditLogEntry[]> {
+  const res = await fetch(`${API_BASE}/audit?limit=${limit}`, withAuth());
+  checkAuth(res);
+  if (!res.ok) await raiseApiError(res, `Couldn't load audit history (${res.status})`);
+  return res.json() as Promise<AuditLogEntry[]>;
+}
+
+/** The audit trail for one scan, oldest first. */
+export async function fetchScanAudit(scanId: string): Promise<AuditLogEntry[]> {
+  const res = await fetch(`${API_BASE}/scans/${encodeURIComponent(scanId)}/audit`, withAuth());
+  checkAuth(res);
+  if (!res.ok) await raiseApiError(res, `Couldn't load this scan's audit trail (${res.status})`);
+  return res.json() as Promise<AuditLogEntry[]>;
+}
+
 /**
  * Fetch (or generate) an AI fix suggestion for one finding.
  * `regenerate=true` bypasses the cache and forces a new LLM call.

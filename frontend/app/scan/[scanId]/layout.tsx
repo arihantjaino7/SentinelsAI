@@ -84,15 +84,27 @@ export default function ScanLayout({ children }: { children: React.ReactNode }) 
           )}
           </div>
 
-          {/* PLAN-v5 Stage B: connecting a repository is what makes the fix
-              flow on a finding row able to open a pull request, so the link to
-              it lives where those findings are read. */}
-          <Link
-            href="/settings"
-            className="font-mono text-xs uppercase tracking-[0.2em] text-muted transition-colors hover:text-parchment"
-          >
-            Settings
-          </Link>
+          <div className="flex items-center gap-5">
+            {/* PLAN-v5 Stage E: this scan's own remediation history —
+                everything Sentinels has recorded planning, opening, or
+                verifying a fix for it. */}
+            <Link
+              href={`/audit?scan=${scanId}`}
+              className="font-mono text-xs uppercase tracking-[0.2em] text-muted transition-colors hover:text-parchment"
+            >
+              Audit
+            </Link>
+
+            {/* PLAN-v5 Stage B: connecting a repository is what makes the fix
+                flow on a finding row able to open a pull request, so the link to
+                it lives where those findings are read. */}
+            <Link
+              href="/settings"
+              className="font-mono text-xs uppercase tracking-[0.2em] text-muted transition-colors hover:text-parchment"
+            >
+              Settings
+            </Link>
+          </div>
         </div>
       </nav>
 

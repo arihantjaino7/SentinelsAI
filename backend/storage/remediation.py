@@ -371,3 +371,31 @@ def list_audit(scan_id: str) -> list[dict]:
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+def list_audit_for_user(user_id: int, limit: int = 100) -> list[dict]:
+    """This user's audit history across every scan, newest first (PLAN-v5
+    Stage E) -- the account-wide view `list_audit` doesn't offer, since that
+    one is scoped to a single scan the caller already knows.
+
+    Joined against `scans` so each row carries enough of its own context
+    (`url`, `target_type`) to be legible on a page that isn't that scan's
+    own -- `LEFT JOIN` because `audit_log.scan_id` is `ON DELETE SET NULL`
+    and a deleted scan's rows should still show up, just without a link.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT audit_log.*, scans.url AS scan_url, scans.target_type AS scan_target_type
+            FROM audit_log
+            LEFT JOIN scans ON scans.id = audit_log.scan_id
+            WHERE audit_log.user_id = ?
+            ORDER BY audit_log.id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
