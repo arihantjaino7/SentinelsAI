@@ -756,13 +756,91 @@ first real PR was, whenever one is set up. 412 backend tests green (33 new); `ts
 
 ---
 
-## Deferred — not in this pass
+## Stage E — the audit browser
 
-**Stage E:** revoke UI, audit browser, remaining Tier 2 fixers (`dependencies.py`,
-`dns.py`, `secret-env-committed`), `netlify.toml` / `nginx.conf` header fixers.
+**Scoped 2026-08-13**, down from the original one-line deferred note (below) after
+three scoping questions confirmed in chat — same discipline as Stage D. The original
+note bundled five unrelated things; two of them turned out not to belong on this
+roadmap at all:
 
-The registry and tier table are *designed for* these; they are not implemented. Three
-working fixers beat twenty half-working ones.
+- **"Revoke UI" is already done.** `app/settings/page.tsx` has a working disconnect
+  button wired to `POST /installations/{id}/revoke`, built during Stage B/C's UI
+  wiring. The one real gap under this heading — no button anywhere calls
+  `unlinkScanRepo()` (Stage D's `DELETE /scans/{id}/link-repo`, plumbed in
+  `lib/api.ts` but never wired to a control) — is a small, one-file frontend fix, not
+  a stage.
+- **The dependency fixer is deferred to its own future stage, not dropped.**
+  `agents/repo/dependencies.py` findings carry only `name@version` plus vulnerability
+  IDs — no "safe fixed version" field. A real fix would need a package-registry/OSV
+  lookup *at apply time*, which is a new kind of network dependency: every existing
+  Fixer only ever reads the repo itself. That's real new architecture (which registry
+  per ecosystem, what to do with a lockfile, whether a version bump can even be
+  expressed as a text diff the way every other Fixer's patch is) and deserves its own
+  scoping and conflict-recording pass, not a corner of this one.
+- **The DNS piece is dropped from the fixer roadmap entirely, and this is the
+  correction:** `subdomain-dangling-dns` is tier 4 ("never auto-fix"), not tier 2 —
+  the original deferred note misclassified it. Its remediation is changing a DNS
+  record at a registrar, which is outside any repository or pull request this
+  project's Fixer contract can express. It was never going to be a Fixer; it stays
+  exactly where `tiers.py` already puts it.
+- **`secret-env-committed` (a real Tier 2 fixer) and the `netlify.toml`/`nginx.conf`
+  header fixers (extending Stage D's `stack.py` to two more targets)** are both still
+  plausible, self-contained future stages — just not this one, per the confirmed scope
+  below.
+
+**Stage E is scoped to the audit browser alone**: `audit_log` (migration 11, written
+since Stage B) has had a `write_audit()` and a `list_audit(scan_id)` since Stage B, but
+nothing reads it back except tests — no endpoint, no UI, at any scope wider than "one
+scan's rows, fetched directly from storage." CLAUDE.md's remediation rule 10 ("every
+write is audited") has been true in the database this whole time and invisible to
+everyone but the developer running a query by hand.
+
+**New:** `storage/remediation.py` gains `list_audit_for_user(user_id, limit=...)` —
+`audit_log.user_id` is already a column (migration 11), so this is a straight `SELECT
+... WHERE user_id = ? ORDER BY id DESC LIMIT ?`, no new table. Two endpoints:
+`GET /audit` (this user's recent rows, account-wide — every scan, not just one) and
+`GET /scans/{id}/audit` (a thin wrapper over the existing `list_audit`, ownership-
+checked the same way `GET /scans/{id}/fix/applications` already is). Each row needs
+enough of its scan's context to be legible outside that scan's own page — at minimum
+the target URL and a link back to it — so the account-wide endpoint joins `scans` for
+`url`/`target_type` rather than returning a bare `scan_id` the frontend would have to
+resolve itself.
+
+**Frontend:** a new `/audit` page, linked from the same nav `/settings` already sits
+in (`app/scan/[scanId]/layout.tsx`'s per-scan nav gets a matching entry, plus a
+top-level link near Settings) — a plain reverse-chronological list: timestamp, action
+(`pr_opened`, `pr_merged`, `fix_verified`, `fix_verified_unrecorded`, `pr_failed`,
+...), which scan/finding, and the `detail` text already written. No new design system
+work — same `glass`/mono-label shapes `/settings` already established.
+
+**Verification:** `list_audit_for_user` offline against a seeded `temp_db` (ordering,
+`user_id` scoping — someone else's rows never appear, limit respected); a `TestClient`
+pass over both endpoints (401 unauthenticated, 403 on `GET /scans/{id}/audit` for
+another user's scan); one live pass reading the real audit history this project has
+already accumulated (the Stage B/C real-PR rows, Stage D's live link-repo pass) —
+the first time any of it will have been *seen*, not just written.
+**Note:** planned, once implemented.
+
+---
+
+## Deferred beyond Stage E — not scoped yet
+
+- `remediation/dependencies.py` — a Tier 2 fixer for `dependency-*` findings. Needs its
+  own design pass for the registry-lookup dependency above.
+- `remediation/secrets.py` (working name) — a Tier 2 fixer for `secret-env-committed-*`,
+  plausibly gitignore-shaped (similar to `GitignoreFixer`) but touching a committed
+  secret, so it needs its own read of CLAUDE.md's remediation rule 9 before it's built.
+- `netlify.toml` / `nginx.conf` header fixers — extends `remediation/stack.py` and
+  `remediation/headers_fix.py`'s `SecurityHeaderFixer` to the two stacks Stage D
+  scoped out.
+- The small `unlinkScanRepo()` UI wiring gap noted above — a one-file frontend fix
+  whenever someone picks it up, not a stage on its own.
+
+`subdomain-dangling-dns` is not on this list. It was on the original one-line Stage E
+note and does not belong on any future one either, per the correction above.
+
+The registry and tier table are *designed for* the fixers above; they are not
+implemented. Three working fixers beat twenty half-working ones.
 
 ---
 
