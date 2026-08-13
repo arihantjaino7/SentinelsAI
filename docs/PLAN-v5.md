@@ -75,8 +75,9 @@
 > as `fix_applications` rows in state `pr_open` with a frozen `plan` snapshot. Per
 > the definition of done below, this satisfies step 11 (PR explains the finding,
 > the change, and what it does *not* fix) through the PR itself; steps 12–16
-> (merge, re-verify, score delta, developer-run reporting) are Stage C — built
-> in the block below, still to be run against a real merge.
+> (merge, re-verify, score delta, developer-run reporting) are Stage C, built in
+> the block below and **run against this real PR on 2026-08-13** — see that
+> follow-up entry for the actual numbers.
 >
 > Two things fixed or noted during this live pass, neither of which touched the
 > ten Stage B rules or any test:
@@ -174,8 +175,9 @@
 > untouched, 200 + `recorded=false` with no application row, 200 +
 > `state=verified` + evidence attached after merge, verification visible on
 > `GET .../fix/applications`, original scan score unchanged, 403 for another
-> user). Steps 12–16 of the definition of done are now *implementable* but not
-> yet *run against a real merge* — that is the developer's pass (see below).
+> user). Steps 12–16 of the definition of done were *implementable* as of this
+> block; **run against a real merge on 2026-08-13** — see the follow-up entry
+> below for the actual numbers.
 > Note:
 > [`learning/63-verifying-a-fix-and-the-score-delta.md`](learning/63-verifying-a-fix-and-the-score-delta.md).
 >
@@ -242,6 +244,39 @@
 > unrelated to this change, left alone). Note:
 > [`learning/65-a-badge-that-costs-one-cheap-request.md`](learning/65-a-badge-that-costs-one-cheap-request.md).
 >
+> **The definition of done closed end to end, 2026-08-13.** [PR #1](https://github.com/arihantjaino7/some-action-v1/pull/1)
+> was merged (`gh pr merge 1 --repo arihantjaino7/some-action-v1 --merge
+> --delete-branch`, commit `8859186`), then `POST
+> .../findings/{key}/verify` was called for real, against the real merged
+> repository, for both findings the PR covered:
+>
+> | Finding | Before | After | Delta | `target_fixed` |
+> |---|---|---|---|---|
+> | `gitignore-present` | 64 | 80 | +16 | true |
+> | `ci-unpinned-action-.github-workflows-ci.yml-L10` | 64 | 80 | +16 | true |
+>
+> Both share one `repo-config` re-run (same agent, same PR), so both report the
+> same delta from the same substitution. `docker-root-user-Dockerfile` — never
+> part of this PR — correctly stayed in `still_failing`. Both `fix_applications`
+> rows moved `pr_open → merged → verified`
+> (`91126615-…`, `43088d12-…`), `GET .../fix/applications` returns the
+> verification evidence on each, and `audit_log` recorded `pr_merged` then
+> `fix_verified` for both. Steps 1–16 of the definition of done are now every
+> one of them a fact, not a claim — 11 through a real PR body, 12 through a
+> real GitHub merge, 13–15 through this table, 16 through the audit rows above.
+>
+> **One real gap this pass surfaced, deliberately not patched here:** the
+> overview page's Autofix badge (previous entry) still read `fixable_count: 5`
+> immediately after both findings above were verified — unchanged. That's
+> because `fixable_findings()` counts against `report.findings`, the scan's
+> frozen original record (conflict #6: scans are immutable), and has no view of
+> `fix_applications` state at all. The badge answers "how many findings did the
+> *original scan* have a Fixer for," not "how many still need one" — those two
+> questions happen to coincide until the first fix is verified, and diverge
+> the moment they aren't. Worth fixing (the badge should probably subtract
+> verified/merged findings, or a re-scan should be encouraged once fixes land),
+> but that is a UI-accuracy decision for whoever picks it up next, not
+> something to silently change mid-instruction.
 
 ---
 
@@ -581,19 +616,20 @@ any of them into chat.
 Create a throwaway public repo containing a **third-party** GitHub Action, no `.gitignore`,
 and a Dockerfile with no `USER` — the Stage B/C test target.
 
-Merge the PR when it appears, then run Verify. Steps 12–16 of the definition of done are
-the developer's; the report must say plainly which steps were run by whom.
-
-Stage C has no UI yet, so Verify is run against the endpoint directly — with the session
-cookie a browser sign-in already set:
+**Done 2026-08-13.** [PR #1](https://github.com/arihantjaino7/some-action-v1/pull/1)
+was merged and both findings verified — real numbers in the "definition of
+done closed end to end" entry above. Merging was run via `gh pr merge`
+against the real repo (`arihantjaino7`'s own account, explicit go-ahead given
+in chat); Verify was run against the endpoint directly with a session cookie
+minted for the same account, the same shape the UI's own fetch calls use:
 
 ```
 POST http://localhost:8011/scans/{scan_id}/findings/{finding_key}/verify
 ```
 
-For the Stage B PR that already exists, that is scan `959843b8-…` on
-`arihantjaino7/some-action-v1` and finding key `gitignore-present` (or
-`ci-unpinned-action-…`). A 409 means the pull request hasn't merged yet.
+(For reference, that was scan `959843b8-…`, finding keys `gitignore-present`
+and `ci-unpinned-action-.github-workflows-ci.yml-L10`. A 409 means the pull
+request hasn't merged yet — the state this section describes until 2026-08-13.)
 
 ---
 
