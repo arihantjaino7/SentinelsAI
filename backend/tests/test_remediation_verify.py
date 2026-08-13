@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 from pathlib import Path
 
+import httpx
 import pytest
 
 from models import (
@@ -443,4 +444,91 @@ async def test_a_repository_that_cannot_be_fetched_is_a_400(
 
     with pytest.raises(VerifyError, match="not found") as exc:
         await verify_finding(report, user, "gitignore-present")
+    assert exc.value.status == 400
+
+
+# --- PLAN-v5 Stage D: verifying a header finding by re-reading the live site -
+
+def _hsts_finding() -> Finding:
+    return Finding(
+        id="missing-hsts",
+        title="Strict-Transport-Security header not set",
+        category="Headers",
+        severity=Severity.HIGH,
+        status=Status.FAIL,
+        agent="headers",
+    )
+
+
+def _patch_live_site(monkeypatch, routes: dict):
+    """Same technique test_remediation_planning.py uses: `_rerun_url_agent`
+    builds its own `httpx.AsyncClient` with no injection point, so this
+    monkeypatches the module `httpx` itself for the duration of one test."""
+    real = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        entry = routes.get(request.url.path)
+        if entry is None:
+            return httpx.Response(404, text="")
+        status, headers, body = entry
+        return httpx.Response(status, headers=headers, text=body)
+
+    def factory(*args, **kwargs):
+        kwargs.pop("transport", None)
+        return real(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+
+
+async def test_a_header_finding_on_a_url_scan_reads_the_live_site(temp_db, monkeypatch):
+    """No repository is re-downloaded here -- `_rerun_url_agent` re-GETs the
+    site itself, which now sends every header `HeadersAgent` originally
+    found missing (the redeployment this stage's own honesty caveat can
+    never promise happened, but did, in this test)."""
+    user, report = _seed(
+        findings=[_hsts_finding()], url="https://example.com", target_type="url",
+    )
+    application = _merged_application(finding_key="missing-hsts")
+    _patch_live_site(monkeypatch, {
+        "/": (200, {
+            "strict-transport-security": "max-age=31536000; includeSubDomains",
+        }, ""),
+    })
+
+    result = await verify_finding(report, user, "missing-hsts")
+
+    assert result.agent == "headers"
+    assert result.ref == "https://example.com"
+    assert result.target_fixed is True
+    assert result.application_id == application.id
+    assert result.recorded is True
+
+    stored = list_fix_applications(SCAN_ID)[0]
+    assert stored.state == FixApplicationState.VERIFIED
+
+
+async def test_a_header_finding_still_failing_reports_no_fix(temp_db, monkeypatch):
+    user, report = _seed(
+        findings=[_hsts_finding()], url="https://example.com", target_type="url",
+    )
+    _merged_application(finding_key="missing-hsts")
+    _patch_live_site(monkeypatch, {"/": (200, {}, "")})  # still no HSTS header
+
+    result = await verify_finding(report, user, "missing-hsts")
+
+    assert result.target_fixed is False
+    assert result.still_failing == ["missing-hsts"]
+
+
+async def test_every_other_url_finding_still_refused(temp_db, monkeypatch):
+    """The bridge is scoped to exactly the four header ids -- everything else
+    a URL agent finds (TLS, DNS, subdomains) has no Fixer and no PR to have
+    merged, so it stays refused."""
+    finding = _hsts_finding()
+    finding.id = "spf-record"
+    finding.agent = "dns"
+    user, report = _seed(findings=[finding], url="https://example.com", target_type="url")
+
+    with pytest.raises(VerifyError, match="live URL") as exc:
+        await verify_finding(report, user, "spf-record")
     assert exc.value.status == 400

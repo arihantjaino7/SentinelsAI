@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from agents.base import ScanContext
 from agents.registry import agent_for as url_agent_for
 from agents.repo.base import RepoContext, list_repo_files
 from agents.repo_registry import repo_agent_for
@@ -39,6 +40,7 @@ from models import (
     VerificationResult,
 )
 from remediation.apply import refresh_applications
+from remediation.headers_fix import FIXABLE_FINDING_IDS as _LINK_REPO_VERIFIABLE_IDS
 from remediation.tokens import TokenError, TokenProvider, default_provider
 from repo.fetch import fetch_repo, parse_github_url
 from scoring import calculate_score
@@ -99,13 +101,20 @@ def _resolve_agent(finding: Finding):
     if agent_cls is not None:
         return agent_cls
 
-    # A URL-scan agent observes a live site, not a repository, so there is no
-    # ref to re-read and no merged pull request to have changed anything.
-    # Bridging the two is PLAN-v5 Stage D's job, not this stage's.
-    if url_agent_for(finding.agent) is not None:
+    url_agent_cls = url_agent_for(finding.agent)
+    if url_agent_cls is not None:
+        # A URL-scan agent observes a live site, not a repository, so there is
+        # normally no ref to re-read and no merged pull request to have
+        # changed anything. The one exception (PLAN-v5 Stage D) is the four
+        # header findings: once a repository is linked, a PR against *it* can
+        # change what the live site actually sends, so re-observing the site
+        # is a real re-check for exactly those ids -- every other URL finding
+        # still has no Fixer and no PR to have merged, so it stays refused.
+        if finding.id in _LINK_REPO_VERIFIABLE_IDS:
+            return url_agent_cls
         raise VerifyError(
             f"{finding.agent!r} scans a live URL, not a repository — verification for "
-            "URL findings is not part of this stage.",
+            "this URL finding is not available yet.",
             status=400,
         )
     raise VerifyError(
@@ -213,6 +222,28 @@ async def _rerun_agent(
     return result, observed_ref
 
 
+async def _rerun_url_agent(report: ScanReport, agent_cls) -> tuple[AgentResult, str]:
+    """Re-run a URL agent against the live site (PLAN-v5 Stage D's bridge).
+
+    There is no git ref here -- what actually changed, if anything, is
+    whatever the site's current deployment sends. The observed "ref" is the
+    URL itself, since that's the one thing that was really re-read; the
+    caller stores it the same way `_rerun_agent` stores a commit ref, so
+    `VerificationResult.ref` always means "what was actually observed."
+    """
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        context = ScanContext(url=report.url, client=client)
+        result = await agent_cls().run(context)
+
+    if result.error:
+        raise VerifyError(
+            f"The {result.agent} agent failed while re-checking the site "
+            f"({result.error}), so nothing can be concluded about the fix.",
+            status=502,
+        )
+    return result, report.url
+
+
 async def verify_finding(
     report: ScanReport,
     user: User,
@@ -227,19 +258,35 @@ async def verify_finding(
     """
     _check_ownership(report.id, user)
 
-    if report.target_type != "repo":
-        raise VerifyError(
-            f"Scan {report.id!r} is a URL scan; there is no repository to re-read.", status=400
-        )
-
     finding = next((f for f in report.findings if f.id == finding_key), None)
     if finding is None:
         raise VerifyError(f"Finding {finding_key!r} is not part of this scan.", status=404)
 
+    # `_resolve_agent` is the actual gate: a repo scan resolves a repo agent
+    # unconditionally, a URL scan only ever resolves one of the four header
+    # ids (PLAN-v5 Stage D), and everything else is refused there with a
+    # specific reason. `report.target_type` alone is no longer enough to
+    # decide this -- a "repo" scan whose agent isn't a repo agent, or a "url"
+    # scan whose finding isn't a header finding, both still have to fail
+    # through that same refusal, not a blanket type check here.
     agent_cls = _resolve_agent(finding)
+    is_repo_agent = repo_agent_for(finding.agent) is not None
+    if is_repo_agent and report.target_type != "repo":
+        # Can't happen from a real scan (a URL scan never produces a repo
+        # agent's findings), but a repo agent has a git ref to re-read and a
+        # URL scan has none -- refuse cleanly rather than let the mismatch
+        # surface as a confusing "not a GitHub repository" error later.
+        raise VerifyError(
+            f"Scan {report.id!r} is a URL scan; there is no repository to re-read.",
+            status=400,
+        )
+
     application = await _application_to_verify(report, user, finding_key, provider)
 
-    result, ref = await _rerun_agent(report, agent_cls, user.id, provider)
+    if is_repo_agent:
+        result, ref = await _rerun_agent(report, agent_cls, user.id, provider)
+    else:
+        result, ref = await _rerun_url_agent(report, agent_cls)
 
     # The substitution: this agent's stored findings are dropped and its fresh
     # ones take their place. Every other agent's findings stay exactly as the

@@ -45,10 +45,10 @@ from models import (
 from remediation import pr_body
 from remediation.budget import MAX_FILES_PER_PR, MAX_PRS_PER_HOUR, MAX_PRS_PER_SCAN
 from remediation.github import GitHubWriteError, GitHubWriter, commit_files
+from remediation.linking import repo_target
 from remediation.patch import PlanValidationError, validate_plan
 from remediation.source import get_file, resolve_ref_sha
 from remediation.tokens import TokenError, TokenProvider, default_provider
-from repo.fetch import parse_github_url
 from storage.installations import active_installation_for
 from storage.scans import scan_owner
 from storage.remediation import (
@@ -255,7 +255,7 @@ async def apply_fixes(
     _check_ownership(report.id, user)                                 # 1
 
     try:
-        owner, repo, url_ref = parse_github_url(report.url)
+        owner, repo, url_ref = repo_target(report)
     except ValueError as exc:
         raise ApplyError(f"This scan's target is not a GitHub repository: {exc}", 400) from exc
 
@@ -415,7 +415,7 @@ async def refresh_applications(
         return applications
 
     try:
-        owner, repo, _ = parse_github_url(report.url)
+        owner, repo, _ = repo_target(report)
     except ValueError:
         return applications
 

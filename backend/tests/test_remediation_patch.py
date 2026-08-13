@@ -152,3 +152,31 @@ def test_validate_plan_rejects_non_create_action_when_finding_has_no_file_path()
     patch = make_patch(".gitignore", "modify", SourceFile(path=".gitignore", content="x", sha="s"), "y")
     with pytest.raises(PlanValidationError, match="only 'create' actions"):
         validate_plan(finding, _plan([patch], finding_key="gitignore-present"))
+
+
+# --- validate_plan: PLAN-v5 Stage D, conflict #12 ----------------------------
+# security-headers is the one fixer allowed to *modify* a path even though its
+# finding carries no file_path -- gated by LINK_REPO_FIXER_PATHS, not a wildcard.
+
+
+def test_validate_plan_accepts_security_headers_modify_at_an_allowed_path():
+    finding = _finding(id="missing-hsts", file_path=None, line=None)
+    patch = make_patch(
+        "vercel.json", "modify", SourceFile(path="vercel.json", content="{}", sha="s"), "{}\n"
+    )
+    validate_plan(
+        finding,
+        _plan([patch], finding_key="missing-hsts", fixer_slug="security-headers", tier=2),
+    )
+
+
+def test_validate_plan_rejects_security_headers_modify_outside_allowed_paths():
+    finding = _finding(id="missing-hsts", file_path=None, line=None)
+    patch = make_patch(
+        "netlify.toml", "modify", SourceFile(path="netlify.toml", content="", sha="s"), "y"
+    )
+    with pytest.raises(PlanValidationError, match="may only touch"):
+        validate_plan(
+            finding,
+            _plan([patch], finding_key="missing-hsts", fixer_slug="security-headers", tier=2),
+        )

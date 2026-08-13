@@ -24,6 +24,14 @@ _EXACT_TIER: dict[str, int] = {
     "gitignore-present": 1,
     "repo-readme-present": 1,
     "repo-env-example-present": 1,
+    # PLAN-v5 Stage D: corrected from the unlisted default (tier 4) once a
+    # Fixer (`remediation/headers_fix.py`) actually exists for these --
+    # review-required, since a header value this fixer writes is a
+    # reasonable default, not the site's own maintainer's choice.
+    "missing-csp": 2,
+    "missing-hsts": 2,
+    "missing-x-content-type-options": 2,
+    "missing-x-frame-options": 2,
     "api-cors-permissive": 2,
     "sensitive-response-cacheable": 2,
     "server-version-disclosed": 2,

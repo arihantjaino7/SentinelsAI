@@ -436,10 +436,10 @@ export async function fetchFixPlan(
   );
   checkAuth(res);
   if (res.status === 404) return null;
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error((body as { detail?: string }).detail ?? `Fix plan unavailable (${res.status})`);
-  }
+  // An ApiError, not a plain Error, so a caller can tell "no repository is
+  // linked yet" (PLAN-v5 Stage D) apart from any other failure by status +
+  // message rather than by guessing from the text alone.
+  if (!res.ok) await raiseApiError(res, `Fix plan unavailable (${res.status})`);
   return res.json() as Promise<FixPlan | null>;
 }
 
@@ -621,6 +621,57 @@ export async function revokeInstallation(installationId: number): Promise<void> 
   );
   checkAuth(res);
   if (!res.ok) await raiseApiError(res, `Couldn't disconnect (${res.status})`);
+}
+
+/* ---------------------------------------------------------------------------
+   PLAN-v5 Stage D: linking a URL scan to the repository that serves it — the
+   bridge a header finding needs, since it has no repository of its own.
+   --------------------------------------------------------------------------- */
+
+// Mirrors backend/models.py `ScanRepoLink`.
+export interface ScanRepoLink {
+  scan_id: string;
+  user_id: number;
+  installation_id: number;
+  owner: string;
+  repo: string;
+  ref: string | null;      // null = the repository's own default branch
+  linked_at: string;
+}
+
+/** The repository currently linked to this scan, or `null`. */
+export async function fetchScanRepoLink(scanId: string): Promise<ScanRepoLink | null> {
+  const res = await fetch(`${API_BASE}/scans/${encodeURIComponent(scanId)}/link-repo`, withAuth());
+  checkAuth(res);
+  if (!res.ok) await raiseApiError(res, `Couldn't load the linked repository (${res.status})`);
+  return res.json() as Promise<ScanRepoLink | null>;
+}
+
+/** Link a URL scan to a repository under an installation the caller already
+ *  holds — `owner` comes from the installation itself, never typed by hand. */
+export async function linkScanRepo(
+  scanId: string,
+  installationId: number,
+  repo: string,
+  ref?: string,
+): Promise<ScanRepoLink> {
+  const res = await fetch(`${API_BASE}/scans/${encodeURIComponent(scanId)}/link-repo`, withAuth({
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ installation_id: installationId, repo, ref: ref || null }),
+  }));
+  checkAuth(res);
+  if (!res.ok) await raiseApiError(res, `Couldn't link that repository (${res.status})`);
+  return res.json() as Promise<ScanRepoLink>;
+}
+
+/** Unlink a scan's repository. */
+export async function unlinkScanRepo(scanId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/scans/${encodeURIComponent(scanId)}/link-repo`, withAuth({
+    method: "DELETE",
+  }));
+  checkAuth(res);
+  if (!res.ok) await raiseApiError(res, `Couldn't unlink that repository (${res.status})`);
 }
 
 /**

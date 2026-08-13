@@ -373,6 +373,26 @@ class GitHubInstallation(BaseModel):
     revoked_at: Optional[str] = None         # None while live
 
 
+class ScanRepoLink(BaseModel):
+    """A URL scan borrowing a repository's write path (PLAN-v5 Stage D).
+
+    A header finding (`agents/headers.py`) has no `file_path` -- it came from
+    observing a live site, not a repository -- so none of the existing
+    Fixers have anywhere to write a patch. This is the bridge: one row says
+    "this URL scan's site is served by this repository", after which
+    `remediation/linking.py`'s `repo_target()` treats the scan exactly like
+    a repo scan for the rest of the fix-plan/apply/verify pipeline.
+    """
+
+    scan_id: str
+    user_id: int
+    installation_id: int
+    owner: str
+    repo: str
+    ref: Optional[str] = None                # None = the repository's own default branch
+    linked_at: str
+
+
 class FixApplyPreview(BaseModel):
     """What `POST /scans/{id}/fix/apply` with `dry_run=true` returns: exactly
     what *would* be pushed, with nothing written anywhere.

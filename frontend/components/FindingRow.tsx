@@ -17,6 +17,7 @@ export function FindingRow({
   finding,
   scanId,
   isRepoScan = false,
+  isUrlHeaderScan = false,
 }: {
   finding: Finding;
   scanId?: string;
@@ -26,6 +27,11 @@ export function FindingRow({
   // findings this stage's fixers most often apply to (`gitignore-present`,
   // `repo-readme-present`) never set one.
   isRepoScan?: boolean;
+  // PLAN-v5 Stage D: the one exception -- the Headers agent's findings on a
+  // URL scan now have a Fixer too, once a repository is linked. Passed
+  // through to FixPlanPanel as `linkable` so it knows a 400 here means
+  // "link a repository" rather than "something's wrong".
+  isUrlHeaderScan?: boolean;
 }) {
   const isCritical = finding.severity === "Critical";
   // Only show the fix button when we have a scanId (legacy Report.tsx passes none).
@@ -109,7 +115,9 @@ export function FindingRow({
         </p>
       )}
 
-      {showFix && scanId && isRepoScan && <FixPlanPanel scanId={scanId} findingKey={finding.id} />}
+      {showFix && scanId && (isRepoScan || isUrlHeaderScan) && (
+        <FixPlanPanel scanId={scanId} findingKey={finding.id} linkable={isUrlHeaderScan} />
+      )}
       {showFix && scanId && <FixSuggestionPanel scanId={scanId} findingKey={finding.id} />}
     </li>
   );

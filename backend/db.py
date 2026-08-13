@@ -325,6 +325,25 @@ _V13_SCHEMA = """
 ALTER TABLE fix_applications ADD COLUMN verification_json TEXT;
 """
 
+# PLAN-v5 Stage D: a URL scan has no repository of its own -- `scan_repo_links`
+# is what lets one borrow a repository's write path, so a header finding (no
+# `file_path`, since it came from observing a live site) can still get a
+# deterministic FixPlan. One row per scan (`scan_id` is the primary key): a
+# URL scan targets one site, so at most one repository is ever "the thing
+# that serves it." `ref` NULL means the repository's own default branch,
+# same convention `fix_applications.branch` and friends already use.
+_V14_SCHEMA = """
+CREATE TABLE scan_repo_links (
+    scan_id          TEXT PRIMARY KEY REFERENCES scans(id) ON DELETE CASCADE,
+    user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    installation_id  INTEGER NOT NULL,
+    owner            TEXT NOT NULL,
+    repo             TEXT NOT NULL,
+    ref              TEXT,
+    linked_at        TEXT NOT NULL
+);
+"""
+
 # Each entry is (version, schema sql to apply to go from version-1 to version).
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _V1_SCHEMA),
@@ -340,6 +359,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (11, _V11_SCHEMA),
     (12, _V12_SCHEMA),
     (13, _V13_SCHEMA),
+    (14, _V14_SCHEMA),
 ]
 
 

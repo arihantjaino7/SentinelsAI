@@ -56,7 +56,17 @@ def test_fixable_findings_is_empty_for_a_clean_scan():
 
 
 def test_fixable_findings_is_empty_when_nothing_has_a_fixer():
-    """URL-scan findings never collide with a Fixer's id, so a URL scan's
-    findings should come back empty without any target_type check here."""
-    findings = [_finding("missing-hsts", status=Status.FAIL), _finding("missing-csp", status=Status.WARN)]
+    findings = [_finding("spf-record", status=Status.FAIL), _finding("totally-unknown-id", status=Status.WARN)]
     assert fixable_findings(findings) == []
+
+
+def test_fixable_findings_includes_header_findings_since_stage_d():
+    """PLAN-v5 Stage D registers `SecurityHeaderFixer` for the four
+    `missing-*` header findings -- unlike every other URL-scan finding,
+    these now do collide with a Fixer's id, which is the whole point of the
+    stage (see conflict #12)."""
+    findings = [
+        _finding("missing-hsts", status=Status.FAIL, agent="headers"),
+        _finding("missing-csp", status=Status.WARN, agent="headers"),
+    ]
+    assert [f.id for f in fixable_findings(findings)] == ["missing-hsts", "missing-csp"]

@@ -278,6 +278,14 @@
 > but that is a UI-accuracy decision for whoever picks it up next, not
 > something to silently change mid-instruction.
 
+> **Stage D designed 2026-08-13**, scoped down from the one-line deferred note below
+> after three scoping questions were confirmed in chat: Next.js + Vercel only (not
+> netlify.toml/nginx.conf — a later stage), linking picks from an already-installed
+> App installation rather than a bare URL paste, and the header findings' tier gets
+> corrected as part of this stage rather than filed separately. See "Stage D" below
+> for the full design, written before any code, per this file's own rule that
+> implementation reality never silently changes the architecture.
+
 ---
 
 ## The problem
@@ -589,12 +597,169 @@ from anywhere; anything else raises.
 
 ---
 
+## Stage D — the URL → repo bridge
+
+A URL scan's four header findings (`missing-csp`, `missing-hsts`,
+`missing-x-content-type-options`, `missing-x-frame-options`, `agents/headers.py`) have
+no `file_path` — there's no repository to patch, just a site. Every Fixer built so far
+assumes a repo scan, whose own GitHub URL already tells `FileSource` where to read.
+Stage D lets a user tell Sentinels which repository *serves* a URL scan's site, so
+these four findings get the same deterministic-fix treatment everything else does.
+
+**Scoped down from the original one-line deferred note** (Next.js + Vercel only;
+netlify.toml/nginx.conf are a later stage) after three questions confirmed in chat
+2026-08-13: link by picking an already-installed App installation (no new GitHub
+permission flow, no repo-listing API call — the user types the repo name under an
+account they've already granted access to); fix the header findings' tier as part of
+this stage, since they're only reachable once this stage exists.
+
+### Conflict #12 — a finding with no `file_path` needs a different anchor for "traces back to the finding"
+
+`patch.py`'s `validate_plan()` enforces one thing above all: a plan may only touch the
+path the finding named. For a finding with no `file_path` (every header finding, since
+`Finding.file_path` is documented as always `None` for a URL-scan finding — an
+invariant this stage does not touch, since mutating it would blur "which findings came
+from observing the live site" for every downstream reader), the existing rule only
+ever permits `action="create"`. That's wrong for Stage D: fixing a header on a site
+that already has a `vercel.json` or `next.config.ts` means *modifying* it, not creating
+a second one.
+
+Resolved the same way `DELETE_ALLOWLIST` resolves "which paths may ever be deleted": a
+small, named, closed table — `LINK_REPO_FIXER_PATHS: dict[str, frozenset[str]]`, keyed
+by `FixPlan.fixer_slug` — of the only paths that fixer is ever allowed to touch when
+the originating finding named none. `security-headers` maps to exactly
+`{"next.config.js", "next.config.ts", "next.config.mjs", "vercel.json"}`. A finding
+with a `file_path` is completely unaffected; this is a new branch, not a loosened one.
+
+### Data model
+
+**Migration `(14, _V14_SCHEMA)`** — one table:
+
+```sql
+CREATE TABLE scan_repo_links (
+    scan_id          TEXT PRIMARY KEY REFERENCES scans(id) ON DELETE CASCADE,
+    user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    installation_id  INTEGER NOT NULL,
+    owner            TEXT NOT NULL,
+    repo             TEXT NOT NULL,
+    ref              TEXT,                   -- NULL = the repo's own default branch
+    linked_at        TEXT NOT NULL
+);
+```
+
+One link per scan (`scan_id` is the primary key) — a URL scan targets one site, so at
+most one repository is ever "the thing that serves it." Linking again replaces the
+row. New model `ScanRepoLink`; new `storage/scan_links.py` (save/get/delete, delete
+scoped to `user_id` the same way `revoke_installation` scopes to its caller).
+
+### `remediation/linking.py` — one resolver, three callers
+
+`planning.py`, `apply.py`, and `verify.py` each used to call
+`parse_github_url(report.url)` directly — correct for a repo scan, meaningless for a
+URL scan (`report.url` is a website, not a GitHub URL). `repo_target(report) -> (owner,
+repo, ref)` centralizes the branch: a repo scan still parses its own URL; a URL scan
+reads `scan_repo_links`, raising `NoRepoTarget` (a `ValueError`, so every existing
+`except ValueError` catch site needs no change) when nothing is linked yet. `ref` is
+`None` when nothing pins one down, meaning "the repository's own default branch" to
+every caller, same as today.
+
+### `remediation/stack.py` — detecting what serves the site
+
+`detect_stack(files: FileSource) -> StackResult | None` probes, in order:
+`vercel.json`, then `next.config.ts` / `next.config.js` / `next.config.mjs`. Vercel
+first: platform-level headers apply regardless of framework, so when both exist the
+deployment's edge network is the layer actually setting the header. `None` means
+neither was found — the fixer declines rather than guessing at an unrecognized stack,
+same honesty rule as every other tier-4 fallback.
+
+### `remediation/headers_fix.py` — `SecurityHeaderFixer`
+
+One Fixer (`slug = "security-headers"`, tier 2 — generated, human must check) handling
+all four `missing-*` header findings, dispatching on the detected stack:
+
+- **`vercel.json`** — the safe general case: structured JSON, no case where a change
+  can't be expressed as data. Parses (`json.loads`; malformed JSON → declines, never
+  guesses), finds or creates a `headers` array entry for `source: "/(.*)"`, adds the
+  missing header key/value if not already present (already present → `None`, nothing
+  left to fix), re-serializes with `json.dumps(indent=2)`.
+- **`next.config.*`** — deliberately narrower, because safely rewriting an arbitrary
+  JS/TS object literal without an AST parser is not something to guess at:
+  - no `next.config.*` exists → **create** one with a minimal `headers()` export
+    covering all four headers in one entry.
+  - one exists with no `headers(` substring anywhere in it → **modify**: insert an
+    `async headers()` property right after the exported object's opening `{`, found
+    via a regex anchored on `module.exports = {` / `export default { ` / `const
+    <name>(: NextConfig)? = {` — the same "find an anchor, insert there" shape
+    `dockerfile.py`'s `USER` insertion already uses. No anchor found → declines.
+  - one exists **and already defines `headers()`** → declines. Merging into an
+    unknown, already-authored headers function is exactly the kind of guess this
+    project's confidence rule forbids; a human editing four lines by hand is safer
+    than Sentinels reformatting a function it can't fully parse.
+
+Registered in `registry.py`'s `FIXERS`; the four header ids move from unlisted
+(silently tier 4) to `tiers.py`'s `_EXACT_TIER` at tier 2 — the actual correction this
+stage's third confirmed question asked for.
+
+### Endpoints
+
+`POST /scans/{id}/link-repo` `{installation_id, repo, ref?}` — 400 if the scan isn't a
+URL scan, 403 if the scan isn't the caller's or the installation isn't a live one they
+hold; `owner` comes from the installation's own `account_login`, never typed by hand,
+so a link can never point at an account the caller has no grant on.
+`GET /scans/{id}/link-repo` — the current link, or `null`.
+`DELETE /scans/{id}/link-repo` — unlink (ownership-scoped).
+
+### Verification re-run: the live site, not a re-cloned repo
+
+Stage C's `verify.py` re-downloads a repository and re-runs one repo agent — meaningless
+for a header finding, whose evidence was always an HTTP response, not a file. Stage D
+adds `_rerun_url_agent`, which re-`GET`s `report.url` (the same request `HeadersAgent`
+made originally) and reports the observed `ref` as the URL itself, since that's what was
+actually re-read. `_resolve_agent`'s blanket refusal of URL-scan agents ("Stage D's job,"
+Stage C's own docstring) narrows to exactly the four header finding ids — every other
+URL agent (TLS, DNS, subdomains) still has no Fixer, no PR to merge, and stays refused.
+Verifying only makes sense once a linked repo's PR has merged (or, per Stage C's
+existing "verify by hand" idle affordance, whenever someone wants to re-check), and the
+same honest caveat every deployment-adjacent check in this project carries applies here
+too: a merged PR is evidence the *file* changed, not proof the site redeployed — the
+verification result is what it always was, "we looked," stated as `target_fixed`, never
+inflated into a guarantee.
+
+### Verification (this stage's own)
+
+Offline: `detect_stack` against fixture trees (vercel-only, next-only, both, neither);
+`SecurityHeaderFixer` for every branch above (happy path per stack, already-fixed,
+malformed `vercel.json`, `next.config` with an existing `headers()`, no anchor found);
+`validate_plan`'s new branch (accepts a `security-headers` modify at an allowed path,
+rejects one at a path outside the table, rejects a plan from any other fixer_slug with
+no `file_path` the same as before); `storage/scan_links.py` CRUD; `repo_target`
+resolution for both scan types. `TestClient` pass over the three link-repo routes
+(ownership, wrong installation, not-a-URL-scan) and a live-linked fix plan/apply/verify
+round trip against a fixture Next.js and a fixture Vercel repo. Then, if a real
+throwaway site + repo pair is available, one real pass — not reported as working
+without it.
+
+**Live-verified 2026-08-13** (seeded session cookie for the real signed-in account,
+same pattern Stage B/C used): a real URL scan of `https://example.com` produced all
+four header findings; clicking "Check for automatic fix" on `missing-csp` correctly
+rendered the link form pre-populated with the real `arihantjaino7` installation (no
+typed `owner`); linking to `some-action-v1` — a real repo with neither `vercel.json`
+nor `next.config.*` — wrote a real `scan_repo_links` row and then, correctly and
+honestly, returned "No automatic fix for this finding" rather than guessing at a
+stack; re-checking `missing-hsts` immediately afterward went straight to the same
+honest decline with no repeat prompt, confirming the link persists and is reused
+across findings on one scan. No throwaway Next.js/Vercel repo exists yet to exercise
+the actual patch-writing path live — that remains to be run the same way Stage B's
+first real PR was, whenever one is set up. 412 backend tests green (33 new); `tsc
+--noEmit` and ESLint clean (the same three pre-existing errors, untouched).
+**Note:** `learning/66-linking-a-url-scan-to-its-repository.md` (planned).
+
+---
+
 ## Deferred — not in this pass
 
-**Stage D:** URL → repo bridge (`link-repo`, `stack.py`, header fixers writing into
-`next.config.ts` / `vercel.json` / `netlify.toml` / `nginx.conf`).
 **Stage E:** revoke UI, audit browser, remaining Tier 2 fixers (`dependencies.py`,
-`dns.py`, `secret-env-committed`).
+`dns.py`, `secret-env-committed`), `netlify.toml` / `nginx.conf` header fixers.
 
 The registry and tier table are *designed for* these; they are not implemented. Three
 working fixers beat twenty half-working ones.

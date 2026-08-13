@@ -11,16 +11,20 @@ import zipfile
 import httpx
 
 from models import Finding, FixPlan, ScanReport
+from remediation.linking import NoRepoTarget, repo_target
 from remediation.patch import PlanValidationError, validate_plan
 from remediation.registry import fixer_for
 from remediation.source import FileSource, resolve_default_ref
-from repo.fetch import parse_github_url
 from storage.remediation import list_fix_plans, save_fix_plan
 
-
+# Kept as a distinct name from `linking.NoRepoTarget` (Stage D) even though
+# both end up meaning "nothing to build a FileSource against": callers that
+# want the specific "link a repository first" wording catch NoRepoTarget,
+# while this stays the general "not fixable this way at all" refusal for a
+# scan whose `target_type` isn't one of the two this pipeline understands.
 class NotARepoScan(ValueError):
-    """Raised when a fix is requested against a URL-scan report -- there is
-    no repository to build a patch against."""
+    """Raised when a fix is requested against a scan with no repository to
+    build a patch against, and no linkable one either."""
 
 
 def _finding(report: ScanReport, finding_key: str) -> Finding | None:
@@ -28,9 +32,10 @@ def _finding(report: ScanReport, finding_key: str) -> Finding | None:
 
 
 async def _file_source(report: ScanReport, client: httpx.AsyncClient) -> FileSource:
-    if report.target_type != "repo":
-        raise NotARepoScan(f"Scan {report.id!r} is a URL scan, not a repo scan.")
-    owner, repo, ref = parse_github_url(report.url)
+    try:
+        owner, repo, ref = repo_target(report)
+    except NoRepoTarget as exc:
+        raise NotARepoScan(str(exc)) from exc
     if ref is None:
         ref = await resolve_default_ref(client, owner, repo)
     return FileSource(client=client, owner=owner, repo=repo, ref=ref)

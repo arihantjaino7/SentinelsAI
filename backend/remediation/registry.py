@@ -9,6 +9,7 @@ from models import Finding, Status
 from remediation.base import Fixer
 from remediation.dockerfile import DockerRootUserFixer
 from remediation.gitignore import GitignoreFixer
+from remediation.headers_fix import SecurityHeaderFixer
 from remediation.scaffolding import EnvExampleFixer, ReadmeFixer
 from remediation.workflows import WorkflowPinFixer
 
@@ -18,6 +19,7 @@ FIXERS: list[Fixer] = [
     ReadmeFixer(),
     EnvExampleFixer(),
     DockerRootUserFixer(),
+    SecurityHeaderFixer(),
 ]
 
 

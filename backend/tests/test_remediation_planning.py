@@ -118,6 +118,45 @@ async def test_preview_plan_raises_not_a_repo_scan_for_url_scans():
         await preview_plan(report, "gitignore-present")
 
 
+# --- PLAN-v5 Stage D: a URL scan linked to a repository ----------------------
+
+async def test_preview_plan_for_a_linked_url_scan_reads_the_linked_repo(monkeypatch, temp_db):
+    from storage.scan_links import save_scan_repo_link
+    from storage.users import sign_in
+
+    user = sign_in(
+        github_id=1, github_login="octo", avatar_url=None,
+        token_hash="hash1", expires_at="2099-01-01T00:00:00+00:00",
+    )
+    _insert_bare_scan("url-scan-1")
+    save_scan_repo_link("url-scan-1", user.id, 500, "octo", "demo")
+
+    _patch_client(monkeypatch, {
+        "/repos/octo/demo": (200, {"content-type": "application/json"}, json.dumps({"default_branch": "main"})),
+        "/repos/octo/demo/contents/vercel.json": _contents_response("v1", "{}"),
+    })
+    finding = Finding(
+        id="missing-hsts", title="t", category="Headers",
+        severity=Severity.HIGH, status=Status.FAIL, agent="headers",
+    )
+    report = _report([finding], target_type="url", url="https://example.com")
+    report.id = "url-scan-1"
+
+    plan = await preview_plan(report, "missing-hsts")
+    assert plan is not None
+    assert plan.patches[0].path == "vercel.json"
+
+
+async def test_preview_plan_for_an_unlinked_url_scan_still_refuses(monkeypatch):
+    finding = Finding(
+        id="missing-hsts", title="t", category="Headers",
+        severity=Severity.HIGH, status=Status.FAIL, agent="headers",
+    )
+    report = _report([finding], target_type="url", url="https://example.com")
+    with pytest.raises(NotARepoScan, match="linked repository"):
+        await preview_plan(report, "missing-hsts")
+
+
 async def test_plan_and_save_persists_valid_plans_and_reports_none_for_the_rest(monkeypatch, temp_db):
     _patch_client(monkeypatch, {
         "/repos/octo/demo": (200, {"content-type": "application/json"}, json.dumps({"default_branch": "main"})),

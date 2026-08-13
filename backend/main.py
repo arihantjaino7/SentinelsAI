@@ -66,7 +66,7 @@ from auth.session import (  # noqa: E402
     token_from_cookie,
 )
 from db import init_db  # noqa: E402
-from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixApplication, FixApplyPreview, FixPlan, FixSuggestion, FixSummary, GitHubInstallation, RepoFileEntry, ScanReport, ScanRequest, ScanSummary, User, VerificationResult  # noqa: E402
+from models import AgentInfo, AgentResult, ChatMessage, ChecklistItem, FixApplication, FixApplyPreview, FixPlan, FixSuggestion, FixSummary, GitHubInstallation, RepoFileEntry, ScanReport, ScanRepoLink, ScanRequest, ScanSummary, User, VerificationResult  # noqa: E402
 from orchestrator import run_scan, run_scan_stream  # noqa: E402
 from remediation.apply import ApplyError, apply_fixes, refresh_applications  # noqa: E402
 from remediation.patch import PlanValidationError  # noqa: E402
@@ -80,6 +80,7 @@ from report.registry import get_exporter, list_formats  # noqa: E402
 from storage.chat import load_messages  # noqa: E402
 from storage.fixes import load_fixes_for_scan  # noqa: E402
 from storage.installations import list_installations, revoke_installation, save_installation  # noqa: E402
+from storage.scan_links import delete_scan_repo_link, get_scan_repo_link, save_scan_repo_link  # noqa: E402
 from storage.repo_files import get_repo_files  # noqa: E402
 from storage.scans import delete_scan, get_scan, list_scans, scan_owner, update_checklist_item  # noqa: E402
 from storage.users import delete_session, sign_in  # noqa: E402
@@ -355,6 +356,71 @@ def installations_revoke(
     """
     if not revoke_installation(user.id, installation_id):
         raise HTTPException(status_code=404, detail="No active installation with that id.")
+    return Response(status_code=204)
+
+
+class LinkRepoRequest(BaseModel):
+    installation_id: int
+    repo: str
+    ref: Optional[str] = None
+
+
+@app.post("/scans/{scan_id}/link-repo", response_model=ScanRepoLink)
+def scan_link_repo(
+    scan_id: str, body: LinkRepoRequest, user: User = Depends(current_user)
+) -> ScanRepoLink:
+    """Link a URL scan to the repository that serves its site (PLAN-v5 Stage D)
+    -- the bridge a header finding needs, since it has no repository of its
+    own to patch.
+
+    `owner` always comes from the installation's own `account_login`, never
+    typed by the caller, so a link can never point at an account they hold
+    no grant on -- the same shape invariant #4 already enforces for applying
+    a fix.
+    """
+    report = get_scan(scan_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"Scan {scan_id!r} not found")
+    if report.target_type != "url":
+        raise HTTPException(
+            status_code=400, detail="Only a URL scan can be linked to a repository."
+        )
+    if scan_owner(scan_id) != user.id:
+        raise HTTPException(status_code=403, detail="This scan belongs to another user.")
+
+    installation = next(
+        (i for i in list_installations(user.id) if i.installation_id == body.installation_id),
+        None,
+    )
+    if installation is None:
+        raise HTTPException(
+            status_code=403, detail="No active installation with that id."
+        )
+
+    return save_scan_repo_link(
+        scan_id, user.id, installation.installation_id, installation.account_login,
+        body.repo, body.ref,
+    )
+
+
+@app.get("/scans/{scan_id}/link-repo", response_model=Optional[ScanRepoLink])
+def scan_get_link(scan_id: str, user: User = Depends(current_user)) -> ScanRepoLink | None:
+    """The repository currently linked to this scan, or `null`."""
+    report = get_scan(scan_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"Scan {scan_id!r} not found")
+    link = get_scan_repo_link(scan_id)
+    if link is None or link.user_id != user.id:
+        return None
+    return link
+
+
+@app.delete("/scans/{scan_id}/link-repo")
+def scan_unlink_repo(scan_id: str, user: User = Depends(current_user)) -> Response:
+    """Unlink a scan's repository. 404 if there was nothing to unlink,
+    including a link that belongs to somebody else."""
+    if not delete_scan_repo_link(scan_id, user.id):
+        raise HTTPException(status_code=404, detail="No linked repository to remove.")
     return Response(status_code=204)
 
 

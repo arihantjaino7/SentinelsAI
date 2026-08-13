@@ -19,6 +19,21 @@ from remediation.tiers import PLANNABLE_TIERS, tier_for
 # safe default while nothing needs the capability yet.
 DELETE_ALLOWLIST: frozenset[str] = frozenset()
 
+# PLAN-v5 Stage D, conflict #12: a header finding (`agents/headers.py`) has
+# no `file_path` -- it came from observing a live site, not a repository --
+# so the "every touched path traces back to the finding's own file_path"
+# rule below has nothing to anchor to. `security-headers` is the one Fixer
+# that legitimately *modifies* an existing file despite that: the anchor for
+# it is this small, named, closed table instead, the same shape
+# DELETE_ALLOWLIST already uses for "the only paths this capability may ever
+# touch." A `Finding` with a `file_path` is completely unaffected by this
+# table; it only applies to the no-`file_path` branch below.
+LINK_REPO_FIXER_PATHS: dict[str, frozenset[str]] = {
+    "security-headers": frozenset(
+        {"next.config.js", "next.config.ts", "next.config.mjs", "vercel.json"}
+    ),
+}
+
 
 class PlanValidationError(ValueError):
     """Raised by `validate_plan()`. Always a rejection -- there is no
@@ -114,6 +129,13 @@ def validate_plan(finding: Finding, plan: FixPlan) -> None:
                 raise PlanValidationError(
                     f"Patch path {patch.path!r} does not match the finding's "
                     f"file_path {finding.file_path!r}."
+                )
+        elif plan.fixer_slug in LINK_REPO_FIXER_PATHS:
+            allowed = LINK_REPO_FIXER_PATHS[plan.fixer_slug]
+            if patch.path not in allowed:
+                raise PlanValidationError(
+                    f"Fixer {plan.fixer_slug!r} may only touch {sorted(allowed)}, "
+                    f"got {patch.path!r}."
                 )
         elif patch.action != "create":
             raise PlanValidationError(

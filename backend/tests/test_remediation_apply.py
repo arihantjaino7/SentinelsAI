@@ -31,6 +31,7 @@ from storage.remediation import (
     save_fix_application,
     save_fix_plan,
 )
+from storage.scan_links import save_scan_repo_link
 from storage.scans import save_scan
 from storage.users import sign_in
 
@@ -383,6 +384,56 @@ async def test_a_live_apply_opens_exactly_one_pull_request(temp_db, monkeypatch)
     assert result.branch.startswith("sentinels/fix-a1b2c3d4-")
     assert calls.count(("POST", f"{BASE}/pulls")) == 1
     assert calls.count(("POST", f"{BASE}/git/refs")) == 1
+
+
+# --- PLAN-v5 Stage D: applying through a linked URL scan --------------------
+
+async def test_a_linked_url_scan_opens_a_pr_against_the_linked_repo(temp_db, monkeypatch):
+    """A URL scan's own `.url` is a website, not a GitHub repository -- the
+    apply pipeline has to read `owner`/`repo` from `scan_repo_links` instead
+    of trying (and failing) to parse it."""
+    calls = _patch_transport(monkeypatch, _happy_routes())
+    user = sign_in(
+        github_id=1, github_login="octo", avatar_url=None,
+        token_hash="hash1", expires_at="2099-01-01T00:00:00+00:00",
+    )
+    report = ScanReport(
+        id=SCAN_ID, url="https://example.com", target_type="url",
+        scanned_at="2026-08-13T00:00:00+00:00", duration_ms=10, score=60, grade="D",
+        findings=[_finding()],
+    )
+    save_scan(report, user_id=user.id)
+    save_fix_plan(report.id, _plan())
+    save_installation(user.id, 500, "octo", "selected")
+    save_scan_repo_link(report.id, user.id, 500, "octo", "demo")
+
+    result = await apply_fixes(
+        report, user, ["gitignore-present"], dry_run=False, provider=_FakeProvider()
+    )
+    assert isinstance(result, FixApplyResult)
+    assert result.repo == "octo/demo"
+    assert calls.count(("POST", f"{BASE}/pulls")) == 1
+
+
+async def test_a_url_scan_with_no_link_is_refused_before_any_write(temp_db, monkeypatch):
+    calls = _patch_transport(monkeypatch, _happy_routes())
+    user = sign_in(
+        github_id=1, github_login="octo", avatar_url=None,
+        token_hash="hash1", expires_at="2099-01-01T00:00:00+00:00",
+    )
+    report = ScanReport(
+        id=SCAN_ID, url="https://example.com", target_type="url",
+        scanned_at="2026-08-13T00:00:00+00:00", duration_ms=10, score=60, grade="D",
+        findings=[_finding()],
+    )
+    save_scan(report, user_id=user.id)
+    save_fix_plan(report.id, _plan())
+    save_installation(user.id, 500, "octo", "selected")
+
+    with pytest.raises(ApplyError, match="linked repository") as exc:
+        await apply_fixes(report, user, ["gitignore-present"], dry_run=False, provider=_FakeProvider())
+    assert exc.value.status == 400
+    assert calls == []
 
 
 async def test_a_live_apply_writes_an_audit_row_and_an_application(temp_db, monkeypatch):
